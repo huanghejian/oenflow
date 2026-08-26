@@ -1,0 +1,962 @@
+{
+  "routing_policy": {
+    "price_version": "2026-08-25_points_report_v1",
+    "tier_model_allowlist": {
+      "low": [
+        "higgsfield-h3",
+        "seedance-2.0",
+        "seedance-2.5",
+        "wan-3.0"
+      ],
+      "medium": [
+        "higgsfield-h3",
+        "seedance-2.0",
+        "seedance-2.5",
+        "wan-3.0"
+      ],
+      "high": [
+        "higgsfield-h3",
+        "seedance-2.0",
+        "seedance-2.5",
+        "wan-3.0"
+      ]
+    },
+    "tier_quality_floor": {
+      "low": 76.0,
+      "medium": 82.0,
+      "high": 88.0
+    },
+    "tier_weights": {
+      "low": {
+        "quality": 0.1,
+        "reliability": 0.1,
+        "cost_efficiency": 0.8
+      },
+      "medium": {
+        "quality": 0.45,
+        "reliability": 0.25,
+        "cost_efficiency": 0.3
+      },
+      "high": {
+        "quality": 0.85,
+        "reliability": 0.15,
+        "cost_efficiency": 0.0
+      }
+    },
+    "low_near_cost_ratio": 1.03,
+    "quality_score_min": 0.0,
+    "quality_score_max": 100.0,
+    "high_quality_gain_threshold": 2.5,
+    "high_near_quality_strategy": "lowest_expected_usable_points",
+    "partition_optimizer": {
+      "enabled": true,
+      "prefer_fewer_calls_when_expected_points_within": 0.5,
+      "max_atomic_segments_per_block": 40
+    },
+    "tier_strategy": {
+      "low": {
+        "objective": "min_expected_usable_points_above_quality_floor",
+        "description": "达到最低交付质量后，优先预计可用积分最低；允许任意模型和preset，只要能力与质量门槛合格。"
+      },
+      "medium": {
+        "objective": "minimum_sufficient_expected_usable_points",
+        "description": "Minimum Sufficient：先达到当前镜头的中档目标质量与最低首轮可用率，再在满足目标的候选中选择预计可用积分最低者；pro仅当没有非pro候选达到目标时使用。"
+      },
+      "high": {
+        "objective": "near_best_quality_with_cost_guardrail",
+        "description": "重要镜头追求接近最佳质量；简单镜头允许H3/S2.0/Wan等候选，只要与最佳质量差不超过阈值且更稳或明显更省。"
+      }
+    },
+    "sr_hard_policy": {
+      "enabled": true,
+      "allowed_shot_size_categories": [
+        "特写",
+        "大特写"
+      ],
+      "require_all_atomic_segments_match": true,
+      "reject_mixed_shot_size_segment": true,
+      "description": "所有名称含SR的preset仅允许全段特写/大特写。近景、中近景、中景、全景、远景及“近景→特写”等混合景别一票否决。手部/眼部/道具特写按“特写”类别处理。"
+    },
+    "medium_value_policy": {
+      "enabled": false,
+      "value_model_ids": [
+        "higgsfield-h3",
+        "wan-3.0"
+      ],
+      "value_preset_tokens": [
+        "mini",
+        "fast",
+        "SR",
+        "补贴版"
+      ],
+      "pro_preset_tokens": [
+        "pro"
+      ],
+      "max_tier_score_loss_for_value": 3.0,
+      "pro_min_quality_gain_over_best_value": 6.5,
+      "pro_min_reliability_gain_over_best_value": 0.06,
+      "description": "V6已由medium_minimum_sufficient_policy取代，保留仅用于旧配置兼容。"
+    },
+    "medium_minimum_sufficient_policy": {
+      "enabled": true,
+      "quality_target_by_story_priority": {
+        "normal": 86.0,
+        "key": 89.0,
+        "climax": 92.0
+      },
+      "reliability_floor_by_story_priority": {
+        "normal": 0.78,
+        "key": 0.82,
+        "climax": 0.85
+      },
+      "critical_requirement_quality_boost": 0.5,
+      "max_critical_quality_boost": 1.5,
+      "pro_last_resort": true,
+      "pro_preset_tokens": [
+        "pro"
+      ],
+      "near_cost_ratio": 1.02,
+      "fallback_when_target_unmet": "best_available_quality_then_reliability_then_points",
+      "description": "中档不是综合分最高，而是刚好满足目标品质的最低预计可用积分。关键/高潮镜头目标更高；如存在非pro候选达到目标，pro直接退出最终竞争。"
+    },
+    "preset_quality_observations": {
+      "seedance_closeup_ordering": [
+        "SR",
+        "fast",
+        "mini"
+      ],
+      "applies_when": [
+        "特写",
+        "大特写"
+      ],
+      "note": "这是实测先验，只通过shot_quality_profiles影响质量分；SR仍必须先通过全段特写/大特写硬门槛。"
+    },
+    "logical_material_input_policy": {
+      "enabled": true,
+      "hard_filter_before_quality_and_price": true,
+      "partition_on_reference_overflow": true,
+      "description": "逻辑素材类型、用途、数量和总文件上限先于质量/价格裁决；不要求真实URL/file_id。超限候选直接invalid，允许在原子自然边界重新分区。"
+    },
+    "logical_reference_binding_stage": "prompt_and_routing_use_asset_id_only; real file binding happens in video executor"
+  },
+  "model_registry": {
+    "higgsfield-h3": {
+      "display_name": "H3",
+      "min_duration": 5,
+      "max_duration": 15,
+      "base_reliability": 0.79,
+      "hard_constraint_profile": "h3",
+      "capabilities": {
+        "acting_precision": 76,
+        "dialogue_lipsync": 72,
+        "identity_consistency": 86,
+        "multi_character_control": 72,
+        "motion_action": 88,
+        "physical_interaction": 72,
+        "camera_control": 94,
+        "prop_precision": 72,
+        "vfx_environment": 86,
+        "temporal_continuity": 76
+      },
+      "params": {
+        "output_count": 1
+      },
+      "preset_profiles": {
+        "720-补贴版": {
+          "enabled": true,
+          "output_resolution": "720P",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 5,
+            "base_points": 5,
+            "extra_points_per_second": 1,
+            "min_duration_seconds": 5,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": -3,
+          "reliability_adjust": -0.02,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "max_critical_requirement_count": 2
+          }
+        },
+        "720P": {
+          "enabled": true,
+          "output_resolution": "720P",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 5,
+            "base_points": 18,
+            "extra_points_per_second": 3,
+            "min_duration_seconds": 5,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": 0.5,
+          "reliability_adjust": 0.01,
+          "emit_resolution_preset": true,
+          "constraints": {}
+        },
+        "2K-补贴版": {
+          "enabled": true,
+          "output_resolution": "2K",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P",
+            "1080P",
+            "2K"
+          ],
+          "pricing": {
+            "base_duration_seconds": 5,
+            "base_points": 8,
+            "extra_points_per_second": 1,
+            "min_duration_seconds": 5,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": -1,
+          "reliability_adjust": -0.01,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "max_level": {
+              "motion_action": "medium",
+              "physical_interaction": "medium"
+            }
+          }
+        },
+        "2K": {
+          "enabled": true,
+          "output_resolution": "2K",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P",
+            "1080P",
+            "2K"
+          ],
+          "pricing": {
+            "base_duration_seconds": 5,
+            "base_points": 30,
+            "extra_points_per_second": 6,
+            "min_duration_seconds": 5,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": 2,
+          "reliability_adjust": 0,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "max_level": {
+              "motion_action": "medium",
+              "physical_interaction": "medium"
+            }
+          }
+        }
+      },
+      "input_capabilities": {
+        "images": {
+          "supported": true,
+          "max_count": 9
+        },
+        "videos": {
+          "supported": true,
+          "max_count": 3,
+          "max_duration_per_file": 15
+        },
+        "audios": {
+          "supported": true,
+          "max_count": 3,
+          "max_duration_per_file": 15
+        },
+        "max_total_files": 12
+      },
+      "reference_modes": {
+        "character_reference": true,
+        "scene_reference": true,
+        "prop_reference": true,
+        "style_reference": true,
+        "video_motion_reference": true,
+        "video_camera_reference": true,
+        "audio_voice_reference": true,
+        "first_frame": false,
+        "last_frame": false
+      }
+    },
+    "wan-3.0": {
+      "display_name": "Wan3.0",
+      "min_duration": 5,
+      "max_duration": 30,
+      "base_reliability": 0.77,
+      "hard_constraint_profile": "wan",
+      "capabilities": {
+        "acting_precision": 70,
+        "dialogue_lipsync": 68,
+        "identity_consistency": 80,
+        "multi_character_control": 68,
+        "motion_action": 78,
+        "physical_interaction": 68,
+        "camera_control": 82,
+        "prop_precision": 78,
+        "vfx_environment": 94,
+        "temporal_continuity": 76
+      },
+      "params": {
+        "output_count": 1
+      },
+      "preset_profiles": {
+        "480P": {
+          "enabled": true,
+          "output_resolution": "480P",
+          "allowed_target_resolutions": [
+            "480P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 5,
+            "base_points": 8,
+            "extra_points_per_second": 1,
+            "min_duration_seconds": 5,
+            "max_duration_seconds": 30,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": -5,
+          "reliability_adjust": -0.02,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "allowed_story_priority": [
+              "normal"
+            ],
+            "max_level": {
+              "motion_action": "low",
+              "physical_interaction": "low",
+              "camera_control": "low"
+            }
+          }
+        },
+        "720P": {
+          "enabled": true,
+          "output_resolution": "720P",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 5,
+            "base_points": 15,
+            "extra_points_per_second": 3,
+            "min_duration_seconds": 5,
+            "max_duration_seconds": 30,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": 0,
+          "reliability_adjust": 0,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "max_level": {
+              "motion_action": "medium",
+              "physical_interaction": "medium",
+              "camera_control": "medium"
+            }
+          }
+        },
+        "1080P": {
+          "enabled": true,
+          "output_resolution": "1080P",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P",
+            "1080P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 5,
+            "base_points": 30,
+            "extra_points_per_second": 6,
+            "min_duration_seconds": 5,
+            "max_duration_seconds": 30,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": 2,
+          "reliability_adjust": -0.01,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "max_level": {
+              "motion_action": "medium",
+              "physical_interaction": "medium",
+              "camera_control": "medium"
+            }
+          }
+        }
+      },
+      "input_capabilities": {
+        "images": {
+          "supported": true,
+          "max_count": 10
+        },
+        "videos": {
+          "supported": true,
+          "max_count": 5
+        },
+        "audios": {
+          "supported": true,
+          "max_count": 5
+        },
+        "max_total_files": 20
+      },
+      "reference_modes": {
+        "character_reference": true,
+        "scene_reference": true,
+        "prop_reference": true,
+        "style_reference": true,
+        "video_motion_reference": true,
+        "video_camera_reference": true,
+        "audio_voice_reference": true,
+        "first_frame": false,
+        "last_frame": false
+      }
+    },
+    "seedance-2.0": {
+      "display_name": "Seedance 2.0",
+      "min_duration": 4,
+      "max_duration": 15,
+      "base_reliability": 0.87,
+      "hard_constraint_profile": "seedance20",
+      "capabilities": {
+        "acting_precision": 86,
+        "dialogue_lipsync": 90,
+        "identity_consistency": 90,
+        "multi_character_control": 86,
+        "motion_action": 86,
+        "physical_interaction": 84,
+        "camera_control": 86,
+        "prop_precision": 84,
+        "vfx_environment": 86,
+        "temporal_continuity": 88
+      },
+      "params": {
+        "output_count": 1,
+        "human_mode": "auto_people"
+      },
+      "preset_profiles": {
+        "480p-fast": {
+          "enabled": true,
+          "output_resolution": "480P",
+          "allowed_target_resolutions": [
+            "480P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 7,
+            "extra_points_per_second": 1,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": -7,
+          "reliability_adjust": -0.03,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "max_high_requirement_count": 2,
+            "max_critical_requirement_count": 1
+          },
+          "shot_quality_profiles": {
+            "特写": 1.5,
+            "大特写": 2.0
+          },
+          "shot_quality_profile_version": "2026-08-25_closeup_sr_gt_fast_gt_mini_v1"
+        },
+        "480p-pro": {
+          "enabled": true,
+          "output_resolution": "480P",
+          "allowed_target_resolutions": [
+            "480P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 8,
+            "extra_points_per_second": 2,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": -3,
+          "reliability_adjust": 0,
+          "emit_resolution_preset": true,
+          "constraints": {},
+          "shot_quality_profiles": {
+            "特写": 2.5,
+            "大特写": 3.0
+          },
+          "shot_quality_profile_version": "2026-08-25_closeup_sr_gt_fast_gt_mini_v1"
+        },
+        "480p-mini": {
+          "enabled": true,
+          "output_resolution": "480P",
+          "allowed_target_resolutions": [
+            "480P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 5,
+            "extra_points_per_second": 1,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": -10,
+          "reliability_adjust": -0.05,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "allowed_story_priority": [
+              "normal"
+            ],
+            "max_high_requirement_count": 1,
+            "max_critical_requirement_count": 0
+          },
+          "shot_quality_profiles": {
+            "特写": 0.0,
+            "大特写": 0.0
+          },
+          "shot_quality_profile_version": "2026-08-25_closeup_sr_gt_fast_gt_mini_v1"
+        },
+        "720p-fast": {
+          "enabled": true,
+          "output_resolution": "720P",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 20,
+            "extra_points_per_second": 5,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": -3.5,
+          "reliability_adjust": -0.02,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "max_critical_requirement_count": 3
+          },
+          "shot_quality_profiles": {
+            "特写": 2.0,
+            "大特写": 2.5
+          },
+          "shot_quality_profile_version": "2026-08-25_closeup_sr_gt_fast_gt_mini_v1"
+        },
+        "720p-pro": {
+          "enabled": true,
+          "output_resolution": "720P",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 24,
+            "extra_points_per_second": 6,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": 2,
+          "reliability_adjust": 0.02,
+          "emit_resolution_preset": true,
+          "constraints": {},
+          "shot_quality_profiles": {
+            "特写": 3.0,
+            "大特写": 3.5
+          },
+          "shot_quality_profile_version": "2026-08-25_closeup_sr_gt_fast_gt_mini_v1"
+        },
+        "720p-mini": {
+          "enabled": true,
+          "output_resolution": "720P",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 13,
+            "extra_points_per_second": 3,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": -7,
+          "reliability_adjust": -0.04,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "allowed_story_priority": [
+              "normal"
+            ],
+            "max_high_requirement_count": 2,
+            "max_critical_requirement_count": 1,
+            "max_level": {
+              "physical_interaction": "medium",
+              "camera_control": "medium",
+              "vfx_environment": "medium"
+            }
+          },
+          "shot_quality_profiles": {
+            "特写": 0.0,
+            "大特写": 0.0
+          },
+          "shot_quality_profile_version": "2026-08-25_closeup_sr_gt_fast_gt_mini_v1"
+        },
+        "720p-SR": {
+          "enabled": true,
+          "output_resolution": "720P",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 12,
+            "extra_points_per_second": 3,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": 0.5,
+          "reliability_adjust": -0.01,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "max_level": {
+              "motion_action": "medium",
+              "physical_interaction": "medium",
+              "camera_control": "medium",
+              "vfx_environment": "medium"
+            },
+            "sr_only": true,
+            "allowed_shot_size_categories": [
+              "特写",
+              "大特写"
+            ],
+            "require_all_segments_match_shot_size": true,
+            "reject_mixed_shot_size_segment": true
+          },
+          "shot_quality_profiles": {
+            "特写": 5.5,
+            "大特写": 6.5
+          },
+          "shot_quality_profile_version": "2026-08-25_closeup_sr_gt_fast_gt_mini_v1"
+        },
+        "1080p-pro": {
+          "enabled": true,
+          "output_resolution": "1080P",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P",
+            "1080P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 60,
+            "extra_points_per_second": 15,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": 3,
+          "reliability_adjust": 0.01,
+          "emit_resolution_preset": true,
+          "constraints": {},
+          "shot_quality_profiles": {
+            "特写": 3.5,
+            "大特写": 4.0
+          },
+          "shot_quality_profile_version": "2026-08-25_closeup_sr_gt_fast_gt_mini_v1"
+        },
+        "1080p-SR": {
+          "enabled": true,
+          "output_resolution": "1080P",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P",
+            "1080P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 26,
+            "extra_points_per_second": 6,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": 1.5,
+          "reliability_adjust": -0.01,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "max_level": {
+              "motion_action": "medium",
+              "physical_interaction": "medium",
+              "camera_control": "medium",
+              "vfx_environment": "medium"
+            },
+            "sr_only": true,
+            "allowed_shot_size_categories": [
+              "特写",
+              "大特写"
+            ],
+            "require_all_segments_match_shot_size": true,
+            "reject_mixed_shot_size_segment": true
+          },
+          "shot_quality_profiles": {
+            "特写": 6.0,
+            "大特写": 7.0
+          },
+          "shot_quality_profile_version": "2026-08-25_closeup_sr_gt_fast_gt_mini_v1"
+        },
+        "2K-SR": {
+          "enabled": true,
+          "output_resolution": "2K",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P",
+            "1080P",
+            "2K"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 28,
+            "extra_points_per_second": 6,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 15,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": 2,
+          "reliability_adjust": -0.015,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "max_level": {
+              "motion_action": "medium",
+              "physical_interaction": "medium",
+              "camera_control": "medium",
+              "vfx_environment": "medium"
+            },
+            "sr_only": true,
+            "allowed_shot_size_categories": [
+              "特写",
+              "大特写"
+            ],
+            "require_all_segments_match_shot_size": true,
+            "reject_mixed_shot_size_segment": true
+          },
+          "shot_quality_profiles": {
+            "特写": 6.2,
+            "大特写": 7.2
+          },
+          "shot_quality_profile_version": "2026-08-25_closeup_sr_gt_fast_gt_mini_v1"
+        }
+      },
+      "input_capabilities": {
+        "images": {
+          "supported": true,
+          "max_count": 9
+        },
+        "videos": {
+          "supported": true,
+          "max_count": 3
+        },
+        "audios": {
+          "supported": true,
+          "max_count": 3
+        },
+        "max_total_files": 12
+      },
+      "reference_modes": {
+        "character_reference": true,
+        "scene_reference": true,
+        "prop_reference": true,
+        "style_reference": true,
+        "video_motion_reference": true,
+        "video_camera_reference": true,
+        "audio_voice_reference": true,
+        "first_frame": false,
+        "last_frame": false
+      }
+    },
+    "seedance-2.5": {
+      "display_name": "Seedance 2.5",
+      "min_duration": 4,
+      "max_duration": 30,
+      "base_reliability": 0.92,
+      "hard_constraint_profile": "seedance25",
+      "capabilities": {
+        "acting_precision": 96,
+        "dialogue_lipsync": 96,
+        "identity_consistency": 96,
+        "multi_character_control": 94,
+        "motion_action": 94,
+        "physical_interaction": 94,
+        "camera_control": 94,
+        "prop_precision": 92,
+        "vfx_environment": 94,
+        "temporal_continuity": 96
+      },
+      "params": {
+        "output_count": 1
+      },
+      "preset_profiles": {
+        "480": {
+          "enabled": true,
+          "output_resolution": "480P",
+          "allowed_target_resolutions": [
+            "480P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 17,
+            "extra_points_per_second": 4,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 30,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": -6,
+          "reliability_adjust": -0.02,
+          "emit_resolution_preset": true,
+          "constraints": {}
+        },
+        "720": {
+          "enabled": true,
+          "output_resolution": "720P",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 38,
+            "extra_points_per_second": 10,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 30,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": 0,
+          "reliability_adjust": 0,
+          "emit_resolution_preset": true,
+          "constraints": {}
+        },
+        "1080": {
+          "enabled": true,
+          "output_resolution": "1080P",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P",
+            "1080P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 94,
+            "extra_points_per_second": 23,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 30,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": 3,
+          "reliability_adjust": 0.01,
+          "emit_resolution_preset": true,
+          "constraints": {}
+        },
+        "1080-SR": {
+          "enabled": true,
+          "output_resolution": "1080P",
+          "allowed_target_resolutions": [
+            "480P",
+            "720P",
+            "1080P"
+          ],
+          "pricing": {
+            "base_duration_seconds": 4,
+            "base_points": 19,
+            "extra_points_per_second": 1,
+            "min_duration_seconds": 4,
+            "max_duration_seconds": 30,
+            "output_count_multiplier": 1,
+            "price_version": "2026-08-25_points_report_v1"
+          },
+          "quality_adjust": 1.5,
+          "reliability_adjust": -0.01,
+          "emit_resolution_preset": true,
+          "constraints": {
+            "max_level": {
+              "motion_action": "medium",
+              "physical_interaction": "medium",
+              "camera_control": "medium",
+              "vfx_environment": "medium",
+              "prop_precision": "high"
+            },
+            "max_critical_requirement_count": 3,
+            "sr_only": true,
+            "allowed_shot_size_categories": [
+              "特写",
+              "大特写"
+            ],
+            "require_all_segments_match_shot_size": true,
+            "reject_mixed_shot_size_segment": true
+          },
+          "shot_quality_profiles": {
+            "特写": 4.5,
+            "大特写": 5.5
+          },
+          "shot_quality_profile_version": "2026-08-25_closeup_sr_v1"
+        }
+      },
+      "input_capabilities": {
+        "images": {
+          "supported": true,
+          "max_count": 30
+        },
+        "videos": {
+          "supported": true,
+          "max_count": 10
+        },
+        "audios": {
+          "supported": true,
+          "max_count": 10
+        },
+        "max_total_files": 50
+      },
+      "reference_modes": {
+        "character_reference": true,
+        "scene_reference": true,
+        "prop_reference": true,
+        "style_reference": true,
+        "video_motion_reference": true,
+        "video_camera_reference": true,
+        "audio_voice_reference": true,
+        "first_frame": false,
+        "last_frame": false
+      }
+    }
+  }
+}
