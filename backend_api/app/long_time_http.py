@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import httpx
+
+from .logging_utils import get_logger, log_payload
 
 
 # 与 Java LongTimeHttp 保持一致。
@@ -13,6 +16,7 @@ WRITE_TIMEOUT_SECONDS = 100.0
 POOL_TIMEOUT_SECONDS = 60.0
 MAX_CONNECTIONS = 64
 KEEPALIVE_MINUTES = 16
+logger = get_logger(__name__)
 
 
 class LongTimeHttpError(RuntimeError):
@@ -69,6 +73,12 @@ def post_json(
     request_headers.setdefault("Authorization", token)
     request_headers.setdefault("Content-Type", "application/json")
     request_headers.setdefault("Accept", "application/json")
+    started_at = time.perf_counter()
+    log_payload(
+        logger,
+        "http.post_json.request",
+        {"url": url, "headers": request_headers, "payload": payload},
+    )
 
     try:
         response = _post_with_connection_retry(
@@ -77,19 +87,44 @@ def post_json(
             request_headers,
         )
     except httpx.TimeoutException as exc:
+        logger.exception("http.post_json.timeout url=%s", url)
         raise RuntimeError(
             f"LongTimeHttp 等待超时（connect={CONNECT_TIMEOUT_SECONDS}s, "
             f"read={READ_TIMEOUT_SECONDS}s, write={WRITE_TIMEOUT_SECONDS}s）"
         ) from exc
     except httpx.TransportError as exc:
+        logger.exception("http.post_json.transport_error url=%s", url)
         raise RuntimeError(f"LongTimeHttp 连接失败: {exc}") from exc
 
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
     if not response.is_success:
+        log_payload(
+            logger,
+            "http.post_json.error_response",
+            {
+                "url": url,
+                "status_code": response.status_code,
+                "elapsed_ms": elapsed_ms,
+                "body": response.text,
+            },
+        )
         raise LongTimeHttpError(response.status_code, response.text[:2000])
     try:
         data = response.json()
     except ValueError as exc:
+        logger.exception("http.post_json.non_json_response url=%s", url)
         raise RuntimeError("LongTimeHttp 收到非 JSON 响应") from exc
     if not isinstance(data, dict):
         raise RuntimeError("LongTimeHttp 响应顶层必须是 JSON 对象")
+    log_payload(
+        logger,
+        "http.post_json.response",
+        {
+            "url": url,
+            "status_code": response.status_code,
+            "elapsed_ms": elapsed_ms,
+            "response_id": response.headers.get("x-request-id"),
+            "body": data,
+        },
+    )
     return data, response.headers.get("x-request-id")

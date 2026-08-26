@@ -698,7 +698,7 @@ def _create_openrouter_director_plan(
     }
     request_url = f"{settings.openrouter_base_url}/chat/completions"
     request_headers = {
-        "HTTP-Referer": "http://localhost:3000",
+        "HTTP-Referer": "http://127.0.0.1:9001",
         "X-OpenRouter-Title": "Short Drama Director Demo",
     }
     requested_max_tokens = request_body["max_tokens"]

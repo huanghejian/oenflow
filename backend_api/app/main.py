@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import logging
+import re
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,14 +15,36 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .contracts import (
+    AutoFlowAnalysisRequest,
+    AutoFlowAssetPromptRequest,
+    AutoFlowAssetSplitRequest,
+    AutoFlowComposeRequest,
+    AutoFlowRouteRequest,
+    AutoFlowSplitRequest,
+    AutoFlowStoryboardSplitRequest,
+    AutoFlowSubmitRequest,
     BindRequest,
     CompileRequest,
     ContinuityAnalyzeRequest,
     DirectorRequest,
     GenerateRequest,
+    PromptTemplateRequest,
     ReferenceImageFromShotRequest,
     ReferenceImagePairRequest,
     WorkflowPlanRequest,
+)
+from .autoflow_service import (
+    analyze_shot_groups,
+    generate_asset_prompts,
+    load_latest_analysis_result,
+    load_latest_asset_prompt_result,
+    load_latest_asset_split_result,
+    load_latest_storyboard_result,
+    route_and_generate_references,
+    split_script_assets,
+    split_script_assets_and_segments,
+    split_script_storyboard,
+    submit_autoflow_video_jobs,
 )
 from .continuity_service import analyze_shot_continuity
 from .demo_service import (
@@ -32,6 +61,15 @@ from .director_service import (
 )
 from .config import settings
 from .executor_binding import bind_logical_assets
+from .logging_utils import (
+    REQUEST_ID_HEADER,
+    configure_logging,
+    get_logger,
+    log_event,
+    log_payload,
+    reset_request_id,
+    set_request_id,
+)
 from .pipeline_service import compile_video_plan
 from .reference_image_service import (
     DEMO_IMAGE_ROOT,
@@ -44,8 +82,10 @@ from .workflow_service import (
     DEMO_INPUT_ASSET_ROOT,
     MAX_IMAGE_BYTES,
     WORKFLOW_UPLOAD_ROOT,
+    WORKFLOW_VIDEO_OUTPUT_ROOT,
     asset_reference_data_urls,
     auto_bind_video_plan,
+    compose_video_jobs,
     missing_asset_ids,
     register_reference_pair,
     registry_snapshot,
@@ -55,10 +95,21 @@ from .workflow_service import (
 )
 
 
+configure_logging()
+logger = get_logger(__name__)
+PROMPT_TEMPLATE_ROOT = settings.project_root.parent / "demo_web" / "public" / "prompts"
+PROMPT_TEMPLATE_FILES = {
+    "asset-split": "asset-split.txt",
+    "asset-prompts": "asset-prompts.txt",
+    "storyboard-split": "storyboard-split.txt",
+    "shot-group-analysis": "shot-group-analysis.txt",
+}
+PROMPT_TEMPLATE_VERSION_ROOT = PROMPT_TEMPLATE_ROOT / "versions"
+PROMPT_VERSION_RE = re.compile(r"^2\.0\.(\d+)$")
 app = FastAPI(title="Short Drama Video Planning API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["http://localhost:9001", "http://127.0.0.1:9001"],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "X-Filename"],
@@ -81,6 +132,177 @@ app.mount(
     StaticFiles(directory=GENERATED_IMAGE_ROOT),
     name="workflow-generated",
 )
+app.mount(
+    "/workflow-videos",
+    StaticFiles(directory=WORKFLOW_VIDEO_OUTPUT_ROOT),
+    name="workflow-videos",
+)
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = request.headers.get(REQUEST_ID_HEADER) or uuid.uuid4().hex[:12]
+    token = set_request_id(request_id)
+    started_at = time.perf_counter()
+    log_event(
+        logger,
+        "http.request.start",
+        method=request.method,
+        path=request.url.path,
+        query=str(request.url.query),
+        client=request.client.host if request.client else None,
+        content_length=request.headers.get("content-length"),
+    )
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.exception(
+            "http.request.failed method=%s path=%s elapsed_ms=%s",
+            request.method,
+            request.url.path,
+            elapsed_ms,
+        )
+        raise
+    else:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        response.headers[REQUEST_ID_HEADER] = request_id
+        log_event(
+            logger,
+            "http.request.end",
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+            elapsed_ms=elapsed_ms,
+        )
+        return response
+    finally:
+        reset_request_id(token)
+
+
+def _run_logged_endpoint(
+    name: str,
+    request_payload: Any,
+    action: Callable[[], dict],
+    *,
+    error_status_code: int = 422,
+) -> dict:
+    log_payload(logger, f"{name}.request", request_payload)
+    try:
+        result = action()
+    except Exception as exc:
+        logger.exception("%s failed", name)
+        log_payload(
+            logger,
+            f"{name}.error",
+            {"error": str(exc), "request": request_payload},
+            level=logging.ERROR,
+        )
+        raise HTTPException(status_code=error_status_code, detail=str(exc)) from exc
+    log_payload(logger, f"{name}.response", result)
+    return result
+
+
+def _prompt_template_path(name: str) -> Path:
+    filename = PROMPT_TEMPLATE_FILES.get(name)
+    if not filename:
+        raise HTTPException(status_code=404, detail=f"未知提示词模板：{name}")
+    return PROMPT_TEMPLATE_ROOT / filename
+
+
+def _prompt_version_dir(name: str) -> Path:
+    _prompt_template_path(name)
+    return PROMPT_TEMPLATE_VERSION_ROOT / name
+
+
+def _prompt_version_number(path: Path) -> int | None:
+    match = PROMPT_VERSION_RE.match(path.stem)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _prompt_version_files(name: str) -> list[Path]:
+    version_dir = _prompt_version_dir(name)
+    if not version_dir.is_dir():
+        return []
+    files = [path for path in version_dir.glob("2.0.*.txt") if _prompt_version_number(path) is not None]
+    return sorted(files, key=lambda path: _prompt_version_number(path) or 0, reverse=True)
+
+
+def _next_prompt_version(name: str) -> str:
+    latest_number = 0
+    for path in _prompt_version_files(name):
+        latest_number = max(latest_number, _prompt_version_number(path) or 0)
+    return f"2.0.{latest_number + 1}"
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(".tmp")
+    temporary_path.write_text(content, encoding="utf-8")
+    temporary_path.replace(path)
+
+
+def _prompt_version_path(name: str, version: str) -> Path:
+    if not PROMPT_VERSION_RE.match(version):
+        raise HTTPException(status_code=404, detail=f"未知提示词版本：{version}")
+    path = _prompt_version_dir(name) / f"{version}.txt"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"提示词版本不存在：{version}")
+    return path
+
+
+@app.get("/v1/autoflow/prompts/{name}")
+def autoflow_prompt_template(name: str) -> dict[str, str]:
+    path = _prompt_template_path(name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"提示词模板不存在：{name}")
+    return {"name": name, "content": path.read_text(encoding="utf-8")}
+
+
+@app.post("/v1/autoflow/prompts/{name}")
+def autoflow_save_prompt_template(name: str, request: PromptTemplateRequest) -> dict[str, Any]:
+    path = _prompt_template_path(name)
+    version_files = _prompt_version_files(name)
+    if version_files:
+        latest_version_path = version_files[0]
+        if latest_version_path.read_text(encoding="utf-8") == request.content:
+            if not path.is_file() or path.read_text(encoding="utf-8") != request.content:
+                _write_text_atomic(path, request.content)
+            return {
+                "name": name,
+                "path": str(path),
+                "version": latest_version_path.stem,
+                "created": False,
+            }
+    version = _next_prompt_version(name)
+    version_path = _prompt_version_dir(name) / f"{version}.txt"
+    _write_text_atomic(version_path, request.content)
+    _write_text_atomic(path, request.content)
+    return {"name": name, "path": str(path), "version": version, "created": True}
+
+
+@app.get("/v1/autoflow/prompts/{name}/versions")
+def autoflow_prompt_versions(name: str) -> dict[str, Any]:
+    versions = []
+    for path in _prompt_version_files(name):
+        version = path.stem
+        stat = path.stat()
+        versions.append(
+            {
+                "version": version,
+                "created_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                "size_bytes": stat.st_size,
+            }
+        )
+    return {"name": name, "versions": versions}
+
+
+@app.get("/v1/autoflow/prompts/{name}/versions/{version}")
+def autoflow_prompt_version(name: str, version: str) -> dict[str, str]:
+    path = _prompt_version_path(name, version)
+    return {"name": name, "version": version, "content": path.read_text(encoding="utf-8")}
 
 
 @app.get("/health")
@@ -306,6 +528,196 @@ def workflow_bind(request: WorkflowPlanRequest) -> dict:
 @app.post("/v1/workflow/video/submit")
 def workflow_submit_video(request: WorkflowPlanRequest) -> dict:
     return submit_video_jobs(request.final_video_plan)
+
+
+@app.post("/v1/autoflow/split")
+def autoflow_split(request: AutoFlowSplitRequest) -> dict:
+    payload = request.model_dump()
+    return _run_logged_endpoint(
+        "autoflow.split",
+        payload,
+        lambda: split_script_assets_and_segments(
+            request.project_params.model_dump(),
+            request.script,
+            request.split_prompt,
+            request.asset_prompt,
+            request.storyboard_prompt,
+            request.assets,
+            request.story_context,
+            request.image_models,
+            request.use_ai,
+        ),
+    )
+
+
+@app.post("/v1/autoflow/assets/split")
+def autoflow_split_assets(request: AutoFlowAssetSplitRequest) -> dict:
+    payload = request.model_dump()
+    return _run_logged_endpoint(
+        "autoflow.assets.split",
+        payload,
+        lambda: split_script_assets(
+            request.project_params.model_dump(),
+            request.script,
+            request.asset_prompt,
+            request.batch_info,
+            request.id_range,
+            request.existing_assets,
+            request.image_models,
+            request.use_ai,
+        ),
+    )
+
+
+@app.post("/v1/autoflow/assets/prompts")
+def autoflow_generate_asset_prompts(request: AutoFlowAssetPromptRequest) -> dict:
+    payload = request.model_dump()
+    return _run_logged_endpoint(
+        "autoflow.assets.prompts",
+        payload,
+        lambda: generate_asset_prompts(
+            request.project_params.model_dump(),
+            request.script,
+            request.assets,
+            request.asset_ledger,
+            request.story_context,
+            request.prompt_instruction,
+            request.image_models,
+            request.use_ai,
+        ),
+    )
+
+
+@app.get("/v1/autoflow/assets/latest")
+def autoflow_load_latest_assets() -> dict:
+    log_event(logger, "autoflow.assets.latest.request")
+    try:
+        result = load_latest_asset_split_result()
+        log_payload(logger, "autoflow.assets.latest.response", result)
+        return result
+    except FileNotFoundError as exc:
+        logger.exception("autoflow.assets.latest not found")
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("autoflow.assets.latest failed")
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/v1/autoflow/assets/prompts/latest")
+def autoflow_load_latest_asset_prompts() -> dict:
+    log_event(logger, "autoflow.assets.prompts.latest.request")
+    try:
+        result = load_latest_asset_prompt_result()
+        log_payload(logger, "autoflow.assets.prompts.latest.response", result)
+        return result
+    except FileNotFoundError as exc:
+        logger.exception("autoflow.assets.prompts.latest not found")
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("autoflow.assets.prompts.latest failed")
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/v1/autoflow/storyboard/split")
+def autoflow_split_storyboard(request: AutoFlowStoryboardSplitRequest) -> dict:
+    payload = request.model_dump()
+    return _run_logged_endpoint(
+        "autoflow.storyboard.split",
+        payload,
+        lambda: split_script_storyboard(
+            request.project_params.model_dump(),
+            request.script,
+            request.assets,
+            request.story_context,
+            request.storyboard_prompt,
+            request.use_ai,
+        ),
+    )
+
+
+@app.get("/v1/autoflow/storyboard/latest")
+def autoflow_load_latest_storyboard() -> dict:
+    log_event(logger, "autoflow.storyboard.latest.request")
+    try:
+        result = load_latest_storyboard_result()
+        log_payload(logger, "autoflow.storyboard.latest.response", result)
+        return result
+    except FileNotFoundError as exc:
+        logger.exception("autoflow.storyboard.latest not found")
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("autoflow.storyboard.latest failed")
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/v1/autoflow/analyze-shot-groups")
+def autoflow_analyze_shot_groups(request: AutoFlowAnalysisRequest) -> dict:
+    payload = request.model_dump()
+    return _run_logged_endpoint(
+        "autoflow.analyze_shot_groups",
+        payload,
+        lambda: analyze_shot_groups(
+            request.project_params.model_dump(),
+            request.assets,
+            request.story_context,
+            request.segments,
+            request.analysis_prompt,
+            request.use_ai,
+        ),
+    )
+
+
+@app.get("/v1/autoflow/analyze-shot-groups/latest")
+def autoflow_load_latest_analysis() -> dict:
+    log_event(logger, "autoflow.analyze_shot_groups.latest.request")
+    try:
+        result = load_latest_analysis_result()
+        log_payload(logger, "autoflow.analyze_shot_groups.latest.response", result)
+        return result
+    except FileNotFoundError as exc:
+        logger.exception("autoflow.analyze_shot_groups.latest not found")
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("autoflow.analyze_shot_groups.latest failed")
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/v1/autoflow/route-and-generate-refs")
+def autoflow_route_and_generate_refs(request: AutoFlowRouteRequest) -> dict:
+    payload = request.model_dump()
+    return _run_logged_endpoint(
+        "autoflow.route_and_generate_refs",
+        payload,
+        lambda: route_and_generate_references(
+            request.project_params.model_dump(),
+            request.assets,
+            request.story_context,
+            request.shot_groups,
+            request.generation_mode,
+            request.image_model,
+        ),
+    )
+
+
+@app.post("/v1/autoflow/video/submit")
+def autoflow_submit_video(request: AutoFlowSubmitRequest) -> dict:
+    payload = request.model_dump()
+    return _run_logged_endpoint(
+        "autoflow.video.submit",
+        payload,
+        lambda: submit_autoflow_video_jobs(request.final_video_plan),
+    )
+
+
+@app.post("/v1/autoflow/video/compose")
+def autoflow_compose_video(request: AutoFlowComposeRequest) -> dict:
+    payload = request.model_dump()
+    jobs = request.jobs or (request.submit_result or {}).get("jobs") or []
+    return _run_logged_endpoint(
+        "autoflow.video.compose",
+        payload,
+        lambda: compose_video_jobs(jobs, request.project_params.model_dump()),
+    )
 
 
 @app.post("/v1/director-plan")

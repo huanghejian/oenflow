@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import base64
+import shutil
+import subprocess
 import threading
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any
@@ -14,12 +17,13 @@ from .executor_binding import bind_logical_assets
 WORKFLOW_ROOT = settings.work_root / "demo_workflow"
 WORKFLOW_UPLOAD_ROOT = WORKFLOW_ROOT / "uploads"
 WORKFLOW_VIDEO_JOB_ROOT = WORKFLOW_ROOT / "video_jobs"
+WORKFLOW_VIDEO_OUTPUT_ROOT = WORKFLOW_ROOT / "video_outputs"
 WORKFLOW_REGISTRY_PATH = WORKFLOW_ROOT / "asset_registry.json"
 DEMO_INPUT_ASSET_ROOT = settings.project_root.parent / "work" / "EP001_V73" / "生成图片"
 DEMO_REFERENCE_ASSET_ROOT = settings.project_root.parent / "work" / "EP001_V73" / "分镜参考图"
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 
-for directory in (WORKFLOW_UPLOAD_ROOT, WORKFLOW_VIDEO_JOB_ROOT):
+for directory in (WORKFLOW_UPLOAD_ROOT, WORKFLOW_VIDEO_JOB_ROOT, WORKFLOW_VIDEO_OUTPUT_ROOT):
     directory.mkdir(parents=True, exist_ok=True)
 
 _registry_lock = threading.Lock()
@@ -223,3 +227,153 @@ def submit_video_jobs(final_video_plan: dict[str, Any]) -> dict[str, Any]:
         "blocked": binding.get("blocked", []),
         "registry_count": binding.get("registry_count", 0),
     }
+
+
+VIDEO_OUTPUT_FIELDS = (
+    "output_video_path",
+    "output_path",
+    "video_path",
+    "output_video_url",
+    "video_url",
+)
+
+
+def _video_source_from_job(job: dict[str, Any]) -> str | None:
+    candidates: list[Any] = [job]
+    for key in ("result", "output", "provider_result", "video_result"):
+        nested = job.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    for candidate in candidates:
+        for field in VIDEO_OUTPUT_FIELDS:
+            value = candidate.get(field)
+            if value:
+                return str(value)
+    return None
+
+
+def _local_path_from_source(source: str) -> Path | None:
+    text = source.strip()
+    if not text:
+        return None
+    parsed = urllib.parse.urlsplit(text)
+    path_text = urllib.parse.unquote(parsed.path if parsed.scheme in {"http", "https"} else text)
+    url_roots = {
+        "/workflow-videos/": WORKFLOW_VIDEO_OUTPUT_ROOT,
+        "/workflow-assets/": WORKFLOW_UPLOAD_ROOT,
+        "/demo-input-assets/": DEMO_INPUT_ASSET_ROOT,
+        "/demo-assets/": DEMO_REFERENCE_ASSET_ROOT,
+    }
+    for prefix, root in url_roots.items():
+        if path_text.startswith(prefix):
+            return (root / Path(path_text.removeprefix(prefix)).name).resolve()
+    path = Path(path_text)
+    if not path.is_absolute():
+        path = (WORKFLOW_VIDEO_JOB_ROOT / path).resolve()
+    return path
+
+
+def _concat_file_line(path: Path) -> str:
+    escaped = path.resolve().as_posix().replace("'", "'\\''")
+    return f"file '{escaped}'"
+
+
+def compose_video_jobs(
+    jobs: list[dict[str, Any]],
+    project_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    compose_id = uuid.uuid4().hex
+    compose_root = WORKFLOW_VIDEO_OUTPUT_ROOT / compose_id
+    compose_root.mkdir(parents=True, exist_ok=True)
+    input_paths: list[Path] = []
+    blocked: list[dict[str, Any]] = []
+    for index, job in enumerate(jobs, start=1):
+        source = _video_source_from_job(job)
+        shot_id = job.get("shot_id") or f"job_{index:03d}"
+        if not source:
+            blocked.append({"shot_id": shot_id, "job_id": job.get("job_id"), "detail": "job 中缺少视频输出路径或 URL"})
+            continue
+        path = _local_path_from_source(source)
+        if path is None or not path.is_file():
+            blocked.append({"shot_id": shot_id, "job_id": job.get("job_id"), "source": source, "detail": "视频文件不存在或不是本地可读文件"})
+            continue
+        input_paths.append(path)
+
+    if not input_paths:
+        return {
+            "mode": "ffmpeg_concat",
+            "compose_id": compose_id,
+            "status": "blocked",
+            "input_count": 0,
+            "blocked_count": len(blocked),
+            "blocked": blocked,
+            "message": "没有可合成的本地分镜视频。",
+        }
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("未找到 ffmpeg，请先安装 ffmpeg 并加入 PATH。")
+
+    concat_path = compose_root / "inputs.txt"
+    concat_path.write_text(
+        "\n".join(_concat_file_line(path) for path in input_paths),
+        encoding="utf-8",
+    )
+    output_name = f"{compose_id}.mp4"
+    output_path = WORKFLOW_VIDEO_OUTPUT_ROOT / output_name
+    command = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(concat_path),
+        "-c",
+        "copy",
+        str(output_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        transcode_command = [
+            ffmpeg,
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_path),
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        result = subprocess.run(
+            transcode_command, capture_output=True, text=True, check=False
+        )
+        command = transcode_command
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg 合成失败: {(result.stderr or result.stdout)[-2000:]}")
+
+    manifest = {
+        "mode": "ffmpeg_concat",
+        "compose_id": compose_id,
+        "status": "completed",
+        "episode_id": (project_params or {}).get("episode_id"),
+        "input_count": len(input_paths),
+        "blocked_count": len(blocked),
+        "blocked": blocked,
+        "output_path": str(output_path),
+        "output_url": f"/workflow-videos/{output_name}",
+        "concat_list": str(concat_path),
+        "command": command,
+    }
+    (compose_root / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return manifest

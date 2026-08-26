@@ -83,3 +83,91 @@ class ReferenceImageFromShotRequest(BaseModel):
 class WorkflowPlanRequest(BaseModel):
     episode_id: str = "EP001"
     final_video_plan: dict[str, Any]
+
+
+class AutoFlowProjectParams(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    episode_id: str = "EP001"
+    project_type: str = "短剧"
+    aspect_ratio: str = "9:16"
+    resolution: str = "720P"
+    routing_tier: RoutingTier = "medium"
+    global_visual_lock: str = ""
+    feedback: str = ""
+
+
+class PromptTemplateRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=300_000)
+
+
+class AutoFlowSplitRequest(BaseModel):
+    project_params: AutoFlowProjectParams = Field(default_factory=AutoFlowProjectParams)
+    script: str = Field(min_length=1)
+    split_prompt: str = Field(min_length=1, max_length=300_000)
+    asset_prompt: str | None = Field(default=None, min_length=1, max_length=100_000)
+    storyboard_prompt: str | None = Field(default=None, min_length=1, max_length=300_000)
+    assets: dict[str, Any] | None = None
+    story_context: dict[str, Any] | None = None
+    image_models: list[str] = Field(default_factory=list)
+    use_ai: bool = True
+
+
+class AutoFlowAssetSplitRequest(BaseModel):
+    project_params: AutoFlowProjectParams = Field(default_factory=AutoFlowProjectParams)
+    script: str = Field(min_length=1)
+    asset_prompt: str = Field(min_length=1, max_length=100_000)
+    batch_info: dict[str, Any] | None = None
+    id_range: dict[str, Any] | None = None
+    existing_assets: str | list[dict[str, Any]] | None = None
+    image_models: list[str] = Field(default_factory=list)
+    use_ai: bool = True
+
+
+class AutoFlowAssetPromptRequest(BaseModel):
+    project_params: AutoFlowProjectParams = Field(default_factory=AutoFlowProjectParams)
+    script: str = Field(min_length=1)
+    assets: dict[str, Any] = Field(default_factory=dict)
+    asset_ledger: dict[str, Any] | None = None
+    story_context: dict[str, Any] = Field(default_factory=dict)
+    prompt_instruction: str = Field(min_length=1, max_length=100_000)
+    image_models: list[str] = Field(default_factory=list)
+    use_ai: bool = True
+
+
+class AutoFlowStoryboardSplitRequest(BaseModel):
+    project_params: AutoFlowProjectParams = Field(default_factory=AutoFlowProjectParams)
+    script: str = Field(min_length=1)
+    assets: dict[str, Any] = Field(default_factory=dict)
+    story_context: dict[str, Any] = Field(default_factory=dict)
+    storyboard_prompt: str = Field(min_length=1, max_length=300_000)
+    use_ai: bool = True
+
+
+class AutoFlowAnalysisRequest(BaseModel):
+    project_params: AutoFlowProjectParams = Field(default_factory=AutoFlowProjectParams)
+    assets: dict[str, Any] = Field(default_factory=dict)
+    story_context: dict[str, Any] = Field(default_factory=dict)
+    segments: list[dict[str, Any]]
+    analysis_prompt: str = Field(min_length=1, max_length=100_000)
+    use_ai: bool = True
+
+
+class AutoFlowRouteRequest(BaseModel):
+    project_params: AutoFlowProjectParams = Field(default_factory=AutoFlowProjectParams)
+    assets: dict[str, Any] = Field(default_factory=dict)
+    story_context: dict[str, Any] = Field(default_factory=dict)
+    shot_groups: list[dict[str, Any]]
+    generation_mode: Literal["demo", "provider"] = "demo"
+    image_model: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class AutoFlowSubmitRequest(BaseModel):
+    project_params: AutoFlowProjectParams = Field(default_factory=AutoFlowProjectParams)
+    final_video_plan: dict[str, Any]
+
+
+class AutoFlowComposeRequest(BaseModel):
+    project_params: AutoFlowProjectParams = Field(default_factory=AutoFlowProjectParams)
+    jobs: list[dict[str, Any]] = Field(default_factory=list)
+    submit_result: dict[str, Any] | None = None

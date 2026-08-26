@@ -1,380 +1,622 @@
 "use client";
-/* eslint-disable @next/next/no-img-element */
 
 import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
-
-type RoutingTier = "low" | "medium" | "high";
-type PromptInfo = { prompt: string; provider?: string; model?: string | null; reasoning_effort?: string | null; internal_output_format?: string | null };
-type AtomicShot = {
-  atomic_id?: string; scene_asset?: string; story_priority?: string; narrative_class?: string;
-  narrative_function?: string; atomic_duration?: number;
-  continuity?: { entry?: string; exit?: string; los?: string };
-  prompt_core?: { timeline_local?: string; guardrail?: string };
-};
-type DirectorPlan = {
-  routing_tier?: string; aspect_ratio?: string;
-  asset_catalog?: { scenes?: string[]; roles?: string[]; props?: string[] };
-  scene_contexts?: unknown[]; atomic_shots?: AtomicShot[];
-};
-type DirectorResponse = {
-  director_plan: DirectorPlan;
-  llm?: { response_id?: string; provider?: string; model?: string; usage?: Record<string, number>; finish_reason?: string };
-};
-type RoutingCandidate = {
-  model?: string; preset?: string; qualified?: boolean; selected?: boolean;
-  fit_quality?: number; reliability?: number; call_points?: number;
-  expected_usable_points?: number; tier_score?: number;
-  hard_reasons?: string[]; margins?: Record<string, number>;
-};
-type RoutingDecision = {
-  tier?: RoutingTier; selected_model?: string; selected_display_name?: string;
-  selected_preset?: string; fit_quality?: number; reliability?: number;
-  call_points?: number; expected_usable_points?: number;
-  medium_target_quality?: number; medium_reliability_floor?: number;
-  medium_target_met?: boolean; medium_selection_mode?: string;
-  candidates?: RoutingCandidate[];
-};
-type RoutingShot = {
-  shot_id?: string; atomic_ids?: string[]; duration?: number;
-  routing_requirements?: Record<string, string>;
-  routing_decision: RoutingDecision;
-};
-type FinalShot = {
-  shot_id?: string; atomic_ids?: string[]; model?: string; duration?: number;
-  model_params?: { resolution_preset?: string }; prompt_zh?: string;
-  references?: Array<{ asset_id?: string; media_type?: string; required?: boolean; derived?: boolean; purpose?: string }>;
-  reference_image_plan?: {
-    input_asset_ids?: string[];
-    output_asset_ids?: { entry?: string; exit?: string };
-    entry_state_reference_prompt_zh?: string;
-    exit_state_reference_edit_prompt_zh?: string;
-  };
-};
-type CompileResponse = {
-  routing_analysis?: { tier?: RoutingTier; shots?: RoutingShot[] };
-  final_video_plan?: { shots?: FinalShot[] };
-  validation?: { ok?: boolean };
-  detail?: string;
-};
-type DemoCase = { input?: {
-  episode_id: string; project_type: string; aspect_ratio: string; resolution: string;
-  global_visual_lock: string; feedback: string; registered_assets: unknown; script: string;
-}; director_plan?: DirectorPlan; llm?: DirectorResponse["llm"] };
-type DebugStage = "director" | "spatial" | "packer" | "router" | "compiler" | "validator";
-type DebugResponse = {
-  stage: DebugStage; title: string; description: string; tier: RoutingTier;
-  input_artifact: string; output_artifact: string; output_size_bytes: number;
-  summary: Record<string, string | number | boolean | null>;
-  preview: Record<string, unknown>; download_url: string; detail?: string;
-};
-type WorkflowStep = "assets" | "references" | "binding" | "submit";
-type AssetRecord = {
-  asset_id?: string; file_id?: string; url?: string; source?: string;
-  original_filename?: string; size_bytes?: number; binding_status?: string;
-};
-type AssetRegistryResponse = { count?: number; assets?: Record<string, AssetRecord>; detail?: string };
-type ReferenceManifest = {
-  job_id?: string; shot_id?: string; status?: string; demo_placeholder?: boolean; message?: string;
-  generation_mode?: string; image_model?: string; prompt_source?: string; usage?: Record<string, unknown>;
-  entry?: { asset_id?: string; image_url?: string; prompt_zh?: string; status?: string };
-  exit?: { asset_id?: string; image_url?: string; prompt_zh?: string; status?: string };
-};
-type ReferenceBulkResponse = {
-  completed_count?: number; blocked_count?: number; completed?: ReferenceManifest[];
-  blocked?: Array<{ shot_id?: string; missing_asset_ids?: string[]; detail?: string }>; detail?: string;
-};
-type BindingResponse = {
-  ready_count?: number; blocked_count?: number; registry_count?: number;
-  ready?: Array<Record<string, unknown>>;
-  blocked?: Array<{ shot_id?: string; missing_required_asset_ids?: string[]; missing_derived_reference_ids?: string[] }>;
-  detail?: string;
-};
-type SubmitResponse = {
-  submitted_count?: number; blocked_count?: number; registry_count?: number; mode?: string;
-  jobs?: Array<{ job_id?: string; shot_id?: string; status?: string; bound_asset_ids?: string[]; derived_reference_ids?: string[] }>;
-  blocked?: BindingResponse["blocked"]; detail?: string;
-};
-type ImageGenerationConfig = {
-  provider?: string; configured?: boolean; model?: string; resolution?: string;
-  quality?: string; aspect_ratio?: string; prompt_source?: string; detail?: string;
-};
-
-const DEBUG_STAGES: Array<{ id: DebugStage; index: string; label: string }> = [
-  { id: "director", index: "A", label: "导演输出" },
-  { id: "spatial", index: "01", label: "空间校验" },
-  { id: "packer", index: "02", label: "分镜打包" },
-  { id: "router", index: "03", label: "模型路由" },
-  { id: "compiler", index: "04", label: "提示词编译" },
-  { id: "validator", index: "05", label: "最终验收" },
-];
-
-const WORKFLOW_STEPS: Array<{ id: WorkflowStep; index: string; label: string }> = [
-  { id: "assets", index: "06", label: "图片资产" },
-  { id: "references", index: "07", label: "站位图" },
-  { id: "binding", index: "08", label: "自动绑定" },
-  { id: "submit", index: "09", label: "视频提交" },
-];
+import RoutingResultPanel from "./components/RoutingResultPanel";
+import ShotGroupAnalysisPanel from "./components/ShotGroupAnalysisPanel";
+import StepTabs from "./components/StepTabs";
+import StoryboardAccordion from "./components/StoryboardAccordion";
+import type {
+  AnalysisResponse,
+  AssetItem,
+  AssetPromptResponse,
+  AssetSplitResponse,
+  AssetRecord,
+  AutoFlowAssets,
+  ComposeResponse,
+  FlowStep,
+  GenerationMode,
+  ProjectParams,
+  ReferenceManifest,
+  RouteResponse,
+  RoutingTier,
+  Segment,
+  SplitResponse,
+  SubmitResponse,
+} from "./components/autoflowTypes";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
+type PromptTemplateName = "asset-split" | "asset-prompts" | "storyboard-split" | "shot-group-analysis";
+type AssetPromptFilter = "all" | "characters" | "scenes" | "items";
+type PromptVersion = {
+  version: string;
+  created_at?: string;
+  size_bytes?: number;
+};
+const PROMPT_TEMPLATE_NAMES: PromptTemplateName[] = ["asset-split", "asset-prompts", "storyboard-split", "shot-group-analysis"];
+const EMPTY_PROMPT_VERSIONS: Record<PromptTemplateName, PromptVersion[]> = {
+  "asset-split": [],
+  "asset-prompts": [],
+  "storyboard-split": [],
+  "shot-group-analysis": [],
+};
+const EMPTY_SELECTED_PROMPT_VERSIONS: Record<PromptTemplateName, string> = {
+  "asset-split": "",
+  "asset-prompts": "",
+  "storyboard-split": "",
+  "shot-group-analysis": "",
+};
 
-function saveFile(name: string, content: string) {
-  const url = URL.createObjectURL(new Blob([content], { type: "application/json;charset=utf-8" }));
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = name;
-  anchor.click();
-  URL.revokeObjectURL(url);
-}
+const FLOW_STEPS: Array<{ id: FlowStep; index: string; title: string; caption: string }> = [
+  { id: "split", index: "01", title: "识别资产", caption: "剧本 / 资产清单" },
+  { id: "assetPrompts", index: "02", title: "资产提示词", caption: "生资产提示词" },
+  { id: "assets", index: "03", title: "拆分镜", caption: "资产 / 分镜提示词" },
+  { id: "analysis", index: "04", title: "镜头组分析", caption: "连续拍摄与4秒拼接" },
+  { id: "routing", index: "05", title: "路由与首尾帧", caption: "模型评分并行生图" },
+  { id: "submit", index: "06", title: "视频生成", caption: "提交分镜视频任务" },
+  { id: "compose", index: "07", title: "视频合成", caption: "ffmpeg 合并分镜视频" },
+];
+
+const EMPTY_ASSETS: AutoFlowAssets = { characters: [], scenes: [], items: [] };
+const DEFAULT_STORYBOARD_PROMPT = `以 Seedance 2.0 分镜导演 Agent 指令系统为基础，只完成分镜结构组织与子镜头规划。
+必须基于上一步资产清单引用角色、场景、关键道具，不要新增未识别的核心资产。
+按 sbid/segment 组织剧情，每个 segment 必须包含 sub_shots，sub_shots 是后续识别连续拍摄、4秒拼接和独立镜头组的基本单位。
+每个子镜头保留 duration、content、scene、characters、items、shot_type、camera_movement、entry_state、performance、exit_state、dialogue、continuity_hint、indivisible。
+分镜规划需要遵守：台词不遗漏、角色/道具引用准确、空间状态连续、活态表演、自然语言运镜、光影氛围、景别角度多样性。
+最终只返回 ai-video 自动流兼容 JSON，不输出审视过程、检查清单或 markdown。`;
+const DEFAULT_ANALYSIS_PROMPT = `请分析相邻子镜头之间的拍摄关系：
+1. 哪些子镜头必须连续拍摄、不可分割。
+2. 哪些子镜头因为不足最小4秒，需要向后拼接成镜头组。
+3. 哪些单个子镜头已满足独立拍摄条件。
+同时为每个镜头组输出首帧普通参考图提示词和尾帧编辑提示词。`;
+const DEFAULT_ASSET_PROMPT_GENERATION_PROMPT = `请基于已识别资产，为每个角色、场景和关键道具生成可直接用于生资产图的提示词。
+要求保留原 id/gid/name，不新增核心资产；每个资产输出 asset_prompt，并分别生成 gpt_image_2、seedream_4、flux_kontext 三套 image_prompts。`;
+const DEMO_SCRIPT = `第1集
+1-1日 外 场景：叶家主殿外
+人物：秦放 叶澜 叶灵 秦族弟子、叶家弟子若干 叶家长老x2
+△秦放立于叶家山门之上，双眼冒冷光，抬手一道金色巨剑穿透云层落下，护山大阵瞬间破碎，叶灵与叶家弟子跪地吐血。
+秦放（讥笑）：一群蝼蚁！（狂傲）让叶澜出来受死！【字幕：秦放 秦家神子】
+叶灵（气愤）：秦放！你欺人太甚！（插入相关画面）入苍龙秘境时，你偷袭暗算我哥，不仅抽他灵根害他修为尽失，现在还要赶尽杀绝！
+秦放（戏弄）：叶澜可是我的好兄弟，不就是用来利用的吗？
+叶灵（祭出飞剑）：我们跟你拼了！
+△叶家弟子站叶灵后祭出飞剑。
+△近景，Q版叶澜躲在远处石柱后探脑袋观战，冒冷汗。【字幕：叶澜】
+叶澜：真倒霉！我本科刚毕业的大学生，就因为网吧通宵打个游戏，竟然穿越了！还穿成了个废人！
+△叶澜小心翼翼退后。
+叶澜OS：还是溜之大吉吧……
+△秦放眼神瞬间锁定叶澜。
+秦放（冷笑）：想逃？
+△秦放拂袖一甩，五道光刃飞去，叶澜惊恐。
+叶澜OS：完了！刚穿越就要死了！
+△叶灵大惊失色。
+叶灵：哥！小心！
+△光刃淹没叶澜，升起浓烟。
+△叶灵流泪，愤怒大吼冲向秦放。
+叶灵：我要为我哥报仇！
+△叶灵与叶家弟子冲向秦放，秦放轻蔑一笑。
+△近景，叶澜看着面板错愕。
+△系统面板升起（面板文字下同）
+系统VO：恭喜宿主挨一刀激活并夕夕系统，获得筑基大圆满修为，当前领取进度99.99%，只需让秦放砍一刀，即可到账。
+叶澜（眼睛冒光）OS：是统子哥，我有救了！
+系统VO：奖励领取时限还剩10秒，超时宿主立即死亡！
+（十秒倒计时特效）
+△叶澜急忙站起。
+叶澜（上前，单手叉腰指着秦放，嚣张表情）：喂，那边的儿砸，有本事来砍你爹啊！
+△叶灵和叶家弟子停下，均是回头看叶澜。（头上全是问号）
+△秦放惊讶，随即蔑笑。
+秦放：一只蝼蚁，还敢挑衅本神子！
+△秦放瞥了一眼叶灵等人，戏谑。
+秦放：让你亲眼看着他们一个个死去而无能为力，也挺有趣……
+△秦放正要转向朝叶家人施决。
+系统VO：三…
+叶澜（焦急，指着秦放破口大骂）：秦放，你个狗娘养的……（电报声）
+△秦放顿时黑脸。
+△叶家人呆滞。（头上全是感叹号）
+叶澜（参考老太太骂街）：你有种就杀我啊！儿砸，你聋了吗？
+△秦放双眼冒着红色杀意。
+秦放：本神子要把你大卸八块！
+系统vo：二。
+△秦放朝着叶澜指，剑呼啸飞去。
+系统VO（音与上面同步）：一。
+△叶澜中剑阴笑。
+叶澜OS：终于上当了！
+系统VO：奖励领取成功。
+△叶澜气息暴涨，秦放被震退数米。
+△秦放满脸不可思议。`;
 
 async function readJson<T>(response: Response): Promise<T> {
   const text = await response.text();
   if (!text) return {} as T;
-  try { return JSON.parse(text) as T; }
-  catch { throw new Error(`服务返回了无法解析的内容（HTTP ${response.status}）`); }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`服务返回了无法解析的内容（HTTP ${response.status}）`);
+  }
+}
+
+async function loadPromptTemplate(name: PromptTemplateName, fallback: string): Promise<string> {
+  try {
+    const response = await fetch(`${API_BASE}/v1/autoflow/prompts/${name}`, { cache: "no-store" });
+    const data = await readJson<{ content?: string; detail?: string }>(response);
+    if (!response.ok || !data.content) throw new Error(data.detail || "后端模板读取失败");
+    return data.content.trim();
+  } catch {
+    try {
+      const response = await fetch(`/prompts/${name}.txt`, { cache: "no-store" });
+      const text = await response.text();
+      if (!response.ok || !text.trim()) throw new Error("前端模板读取失败");
+      return text.trim();
+    } catch {
+      if (fallback.trim()) return fallback.trim();
+      throw new Error(`提示词模板读取失败：${name}`);
+    }
+  }
+}
+
+async function savePromptTemplate(name: PromptTemplateName, content: string): Promise<{ version?: string }> {
+  const response = await fetch(`${API_BASE}/v1/autoflow/prompts/${name}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  const data = await readJson<{ detail?: string; version?: string }>(response);
+  if (!response.ok) throw new Error(data.detail || `提示词模板保存失败：${name}`);
+  return data;
+}
+
+function projectDefaults(): ProjectParams {
+  return {
+    episode_id: "EP001",
+    project_type: "短剧",
+    aspect_ratio: "9:16",
+    resolution: "720P",
+    routing_tier: "medium",
+    global_visual_lock: "东方玄幻真人短剧，冷青灰电影质感",
+    feedback: "",
+  };
+}
+
+function assetsHaveGeneratedPrompts(result: AssetSplitResponse | null): boolean {
+  if (!result) return false;
+  const allAssets = [
+    ...(result.assets.characters || []),
+    ...(result.assets.scenes || []),
+    ...(result.assets.items || []),
+  ];
+  return allAssets.length > 0 && allAssets.every((asset) => {
+    return Boolean(asset.asset_prompt) && Boolean(asset.image_prompts && Object.keys(asset.image_prompts).length);
+  });
 }
 
 export default function Home() {
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
-  const [demoAvailable, setDemoAvailable] = useState(false);
-  const [promptInfo, setPromptInfo] = useState<PromptInfo | null>(null);
-  const [directorPrompt, setDirectorPrompt] = useState("");
-  const [episodeId, setEpisodeId] = useState("EP001");
-  const [projectType, setProjectType] = useState("短剧");
-  const [aspectRatio, setAspectRatio] = useState("9:16");
-  const [resolution, setResolution] = useState("720P");
-  const [tier, setTier] = useState<RoutingTier>("medium");
-  const [continuityTracking, setContinuityTracking] = useState(true);
-  const [visualLock, setVisualLock] = useState("东方玄幻真人短剧，冷青灰电影质感");
-  const [feedback, setFeedback] = useState("");
-  const [assetsText, setAssetsText] = useState('{\n  "scenes": [],\n  "roles": [],\n  "props": []\n}');
-  const [continuityText, setContinuityText] = useState("{}");
-  const [script, setScript] = useState("");
-  const [result, setResult] = useState<DirectorResponse | null>(null);
-  const [compiled, setCompiled] = useState<CompileResponse | null>(null);
-  const [running, setRunning] = useState(false);
-  const [phase, setPhase] = useState<"director" | "routing">("director");
-  const [elapsed, setElapsed] = useState(0);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const [resultMode, setResultMode] = useState<"overview" | "json">("overview");
-  const [debugStage, setDebugStage] = useState<DebugStage | null>(null);
-  const [debugResult, setDebugResult] = useState<DebugResponse | null>(null);
-  const [debugLoading, setDebugLoading] = useState(false);
-  const [debugError, setDebugError] = useState("");
-  const [workflowStep, setWorkflowStep] = useState<WorkflowStep>("assets");
-  const [assetRegistry, setAssetRegistry] = useState<Record<string, AssetRecord>>({});
-  const [selectedWorkflowShotId, setSelectedWorkflowShotId] = useState("");
-  const [referenceManifests, setReferenceManifests] = useState<Record<string, ReferenceManifest>>({});
-  const [referenceBulk, setReferenceBulk] = useState<ReferenceBulkResponse | null>(null);
-  const [bindingResult, setBindingResult] = useState<BindingResponse | null>(null);
+  const [activeStep, setActiveStep] = useState<FlowStep>("split");
+  const [projectParams, setProjectParams] = useState<ProjectParams>(() => projectDefaults());
+  const [assetPrompt, setAssetPrompt] = useState("");
+  const [assetPromptGenerationPrompt, setAssetPromptGenerationPrompt] = useState(DEFAULT_ASSET_PROMPT_GENERATION_PROMPT);
+  const [storyboardPrompt, setStoryboardPrompt] = useState(DEFAULT_STORYBOARD_PROMPT);
+  const [analysisPrompt, setAnalysisPrompt] = useState(DEFAULT_ANALYSIS_PROMPT);
+  const [promptVersions, setPromptVersions] = useState<Record<PromptTemplateName, PromptVersion[]>>(EMPTY_PROMPT_VERSIONS);
+  const [selectedPromptVersions, setSelectedPromptVersions] = useState<Record<PromptTemplateName, string>>(EMPTY_SELECTED_PROMPT_VERSIONS);
+  const [script, setScript] = useState(DEMO_SCRIPT);
+  const [assetResult, setAssetResult] = useState<AssetSplitResponse | null>(null);
+  const [assetPromptResult, setAssetPromptResult] = useState<AssetPromptResponse | null>(null);
+  const [splitResult, setSplitResult] = useState<SplitResponse | null>(null);
+  const [analysisResult, setAnalysisResult] = useState<AnalysisResponse | null>(null);
+  const [routeResult, setRouteResult] = useState<RouteResponse | null>(null);
   const [submitResult, setSubmitResult] = useState<SubmitResponse | null>(null);
-  const [workflowBusy, setWorkflowBusy] = useState("");
-  const [workflowError, setWorkflowError] = useState("");
-  const [workflowNotice, setWorkflowNotice] = useState("");
-  const [imageGenerationConfig, setImageGenerationConfig] = useState<ImageGenerationConfig | null>(null);
-  const [imageGenerationMode, setImageGenerationMode] = useState<"demo" | "provider">("demo");
+  const [composeResult, setComposeResult] = useState<ComposeResponse | null>(null);
+  const [assetRegistry, setAssetRegistry] = useState<Record<string, AssetRecord>>({});
+  const [assetPromptFilter, setAssetPromptFilter] = useState<AssetPromptFilter>("all");
+  const [assetPromptPreviewAsset, setAssetPromptPreviewAsset] = useState<AssetItem | null>(null);
+  const [assetPromptPreviewVariant, setAssetPromptPreviewVariant] = useState("");
+  const [generationMode, setGenerationMode] = useState<GenerationMode>("demo");
   const [imageModel, setImageModel] = useState("openai/gpt-image-2");
+  const [busy, setBusy] = useState("");
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+
+  const assets = splitResult?.assets || assetPromptResult?.assets || assetResult?.assets || EMPTY_ASSETS;
+  const storyContext = splitResult?.story_context || assetPromptResult?.story_context || assetResult?.story_context || {};
+  const segments = splitResult?.segments || [];
+  const shotGroups = analysisResult?.shot_groups || [];
+  const routingShots = routeResult?.routing_analysis?.shots || [];
+  const finalShots = routeResult?.final_video_plan?.shots || [];
+  const assetPromptAssets = assetPromptResult?.assets || assetResult?.assets || EMPTY_ASSETS;
+  const assetPromptCards = useMemo(() => {
+    const groups: Array<{ key: Exclude<AssetPromptFilter, "all">; label: string; glyph: string; items: AssetItem[] }> = [
+      { key: "characters", label: "角色", glyph: "角", items: assetPromptAssets.characters || [] },
+      { key: "scenes", label: "场景", glyph: "场", items: assetPromptAssets.scenes || [] },
+      { key: "items", label: "道具", glyph: "道", items: assetPromptAssets.items || [] },
+    ];
+    return groups.flatMap((group) => group.items.map((asset) => ({ ...group, asset })));
+  }, [assetPromptAssets]);
+  const filteredAssetPromptCards = assetPromptFilter === "all" ? assetPromptCards : assetPromptCards.filter((item) => item.key === assetPromptFilter);
+  const readyAssetCount = assetPromptCards.filter((item) => assetRegistry[item.asset.id]).length;
+  const referenceMap = useMemo(() => {
+    const map: Record<string, ReferenceManifest> = {};
+    for (const manifest of routeResult?.reference_generation?.completed || []) {
+      if (manifest.shot_id) map[manifest.shot_id] = manifest;
+    }
+    return map;
+  }, [routeResult]);
+  const completedSteps = useMemo(() => {
+    const done = new Set<FlowStep>();
+    if (assetResult) done.add("split");
+    if (assetPromptResult) done.add("assetPrompts");
+    if (splitResult) done.add("assets");
+    if (analysisResult) done.add("analysis");
+    if (routeResult) done.add("routing");
+    if (submitResult) done.add("submit");
+    if (composeResult) done.add("compose");
+    return done;
+  }, [analysisResult, assetPromptResult, assetResult, composeResult, routeResult, splitResult, submitResult]);
+  const currentStepIndex = Math.max(0, FLOW_STEPS.findIndex((step) => step.id === activeStep));
+  const currentStep = FLOW_STEPS[currentStepIndex] || FLOW_STEPS[0];
+  const progressPercent = ((currentStepIndex + 1) / FLOW_STEPS.length) * 100;
 
   useEffect(() => {
     let cancelled = false;
     async function bootstrap() {
       try {
-        const [healthResponse, promptResponse, imageConfigResponse] = await Promise.all([
-          fetch(`${API_BASE}/health`, { cache: "no-store" }),
-          fetch(`${API_BASE}/v1/director-prompt`, { cache: "no-store" }),
-          fetch(`${API_BASE}/v1/workflow/image-generation`, { cache: "no-store" }),
+        const response = await fetch(`${API_BASE}/health`, { cache: "no-store" });
+        const data = await readJson<{ ok?: boolean; reference_image_provider_available?: boolean }>(response);
+        if (cancelled) return;
+        setBackendOnline(Boolean(response.ok && data.ok));
+      } catch {
+        if (!cancelled) setBackendOnline(false);
+      }
+    }
+    async function loadPromptTemplates() {
+      try {
+        const [assetSplit, assetPrompts, storyboardSplit, shotGroupAnalysis] = await Promise.all([
+          loadPromptTemplate("asset-split", ""),
+          loadPromptTemplate("asset-prompts", DEFAULT_ASSET_PROMPT_GENERATION_PROMPT),
+          loadPromptTemplate("storyboard-split", DEFAULT_STORYBOARD_PROMPT),
+          loadPromptTemplate("shot-group-analysis", DEFAULT_ANALYSIS_PROMPT),
         ]);
-        const health = await readJson<{ ok?: boolean; demo_available?: boolean }>(healthResponse);
-        const prompt = await readJson<PromptInfo & { detail?: string }>(promptResponse);
-        const imageConfig = await readJson<ImageGenerationConfig>(imageConfigResponse);
-        if (!healthResponse.ok) throw new Error("后端健康检查失败");
-        if (!promptResponse.ok) throw new Error(prompt.detail || "默认 Prompt 读取失败");
         if (cancelled) return;
-        setBackendOnline(Boolean(health.ok));
-        setDemoAvailable(Boolean(health.demo_available));
-        setPromptInfo(prompt);
-        setDirectorPrompt(prompt.prompt);
-        if (imageConfigResponse.ok) {
-          setImageGenerationConfig(imageConfig);
-          setImageModel(imageConfig.model || "openai/gpt-image-2");
-        }
+        setAssetPrompt(assetSplit);
+        setAssetPromptGenerationPrompt(assetPrompts);
+        setStoryboardPrompt(storyboardSplit);
+        setAnalysisPrompt(shotGroupAnalysis);
       } catch (caught) {
-        if (cancelled) return;
-        setBackendOnline(false);
-        setError(caught instanceof Error ? caught.message : "无法连接本地后端");
+        if (!cancelled) setError(caught instanceof Error ? caught.message : "提示词模板读取失败");
       }
     }
     void bootstrap();
-    return () => { cancelled = true; };
-  }, []);
-
-  useEffect(() => {
-    if (!running) return;
-    const started = Date.now();
-    const timer = window.setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
-    return () => window.clearInterval(timer);
-  }, [running]);
-
-  const shots = useMemo(() => result?.director_plan.atomic_shots || [], [result]);
-  const totalDuration = useMemo(() => shots.reduce((sum, shot) => sum + (shot.atomic_duration || 0), 0), [shots]);
-  const jsonOutput = useMemo(() => result ? JSON.stringify(result.director_plan, null, 2) : "", [result]);
-  const finalById = useMemo(() => {
-    const map = new Map<string, FinalShot>();
-    for (const shot of compiled?.final_video_plan?.shots || []) {
-      if (shot.shot_id) map.set(shot.shot_id, shot);
-    }
-    return map;
-  }, [compiled]);
-  const routingByAtomic = useMemo(() => {
-    const map = new Map<string, RoutingShot>();
-    for (const route of compiled?.routing_analysis?.shots || []) {
-      for (const atomicId of route.atomic_ids || []) map.set(atomicId, route);
-    }
-    return map;
-  }, [compiled]);
-  const finalShots = useMemo(() => compiled?.final_video_plan?.shots || [], [compiled]);
-  const selectedWorkflowShot = useMemo(
-    () => finalShots.find((shot) => shot.shot_id === selectedWorkflowShotId) || finalShots[0],
-    [finalShots, selectedWorkflowShotId],
-  );
-  const selectedReferenceManifest = selectedWorkflowShot?.shot_id
-    ? referenceManifests[selectedWorkflowShot.shot_id]
-    : undefined;
-  const workflowAssets = useMemo(() => {
-    const assets = new Map<string, { asset_id: string; required: boolean; usedBy: string[] }>();
-    for (const shot of finalShots) {
-      for (const reference of shot.references || []) {
-        if (!reference.asset_id || reference.derived || reference.media_type !== "image") continue;
-        const current = assets.get(reference.asset_id) || { asset_id: reference.asset_id, required: false, usedBy: [] };
-        current.required = current.required || Boolean(reference.required);
-        if (shot.shot_id && !current.usedBy.includes(shot.shot_id)) current.usedBy.push(shot.shot_id);
-        assets.set(reference.asset_id, current);
-      }
-    }
-    return [...assets.values()].sort((a, b) => Number(b.required) - Number(a.required) || a.asset_id.localeCompare(b.asset_id, "zh-CN"));
-  }, [finalShots]);
-
-  useEffect(() => {
-    if (!finalShots.length) return;
+    void loadPromptTemplates();
+    void refreshAllPromptVersions();
     void refreshAssetRegistry();
-  }, [finalShots]);
-
-  function selectedReason(decision: RoutingDecision): string {
-    if (decision.tier === "medium" && decision.medium_target_met) {
-      return `质量 ${decision.fit_quality?.toFixed(2)} ≥ 目标 ${decision.medium_target_quality?.toFixed(2)}，可靠性 ${((decision.reliability || 0) * 100).toFixed(1)}% ≥ ${((decision.medium_reliability_floor || 0) * 100).toFixed(1)}%；按 Minimum Sufficient 选择满足门槛后的预计可用积分最优方案。`;
-    }
-    if (decision.tier === "low") {
-      return `该候选通过接口硬准入并满足 LOW 质量底线，按最低预计可用积分与 LOW 模型梯队胜出。`;
-    }
-    if (decision.tier === "high") {
-      return `该候选进入近最佳质量窗口，并在画质、可靠性与积分护栏的综合比较中胜出。`;
-    }
-    return "该候选通过硬准入，并在当前档位的确定性评分与成本规则中胜出。";
-  }
-
-  function candidateReason(candidate: RoutingCandidate): string {
-    if (candidate.selected) return "已选：当前档位策略胜出";
-    if (!candidate.qualified) return candidate.hard_reasons?.join("；") || "未通过接口硬准入";
-    return "合格，但质量门槛、可靠性或积分排序未胜出";
-  }
-
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    setError(""); setNotice("");
-    setRunning(true); setPhase("director"); setElapsed(0); setResult(null); setCompiled(null);
-    try {
-      const response = await fetch(`${API_BASE}/v1/demo/sample`, { cache: "no-store" });
-      const data = await readJson<DemoCase & { detail?: string }>(response);
-      if (!response.ok || !data.director_plan) throw new Error(data.detail || "内置 Demo A 阶段数据不可用");
-      setResult({ director_plan: data.director_plan, llm: data.llm }); setResultMode("overview");
-      setNotice("已加载内置 A 阶段 Demo，本次没有调用 OpenRouter。点击“下一步”查看拼接提示词与评分。");
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "Demo 数据加载失败"); }
-    finally { setRunning(false); }
-  }
-
-  async function compileNext() {
-    if (!result) return;
-    setError(""); setNotice(""); setRunning(true); setPhase("routing"); setElapsed(0);
-    try {
-      const compileResponse = await fetch(`${API_BASE}/v1/demo/tier/${tier}`, { cache: "no-store" });
-      const compileData = await readJson<CompileResponse>(compileResponse);
-      if (!compileResponse.ok) throw new Error(compileData.detail || `Demo 评分数据加载失败（HTTP ${compileResponse.status}）`);
-      setCompiled(compileData);
-      setSelectedWorkflowShotId(compileData.final_video_plan?.shots?.[0]?.shot_id || "");
-      setReferenceBulk(null); setBindingResult(null); setSubmitResult(null);
-      setResultMode("overview");
-      setNotice(`已加载内置 ${tier.toUpperCase()} 档拼接提示词与候选评分。`);
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "Demo 评分加载失败"); }
-    finally { setRunning(false); }
-  }
-
-  async function loadDemoInput() {
-    setError(""); setNotice("");
-    try {
-      const response = await fetch(`${API_BASE}/v1/demo/sample`, { cache: "no-store" });
-      const data = await readJson<DemoCase & { detail?: string }>(response);
-      if (!response.ok || !data.input) throw new Error(data.detail || "演示输入不可用");
-      setEpisodeId(data.input.episode_id); setProjectType(data.input.project_type);
-      setAspectRatio(data.input.aspect_ratio); setResolution(data.input.resolution);
-      setVisualLock(data.input.global_visual_lock); setFeedback(data.input.feedback);
-      setAssetsText(JSON.stringify(data.input.registered_assets, null, 2)); setScript(data.input.script);
-      setNotice("已载入演示资产和剧本；后续按钮只读取本地 Demo，不调用 OpenRouter。");
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "演示输入加载失败"); }
-  }
-
-  async function copyResult() {
-    try { await navigator.clipboard.writeText(jsonOutput); setNotice("A 阶段 JSON 已复制。"); }
-    catch { setError("复制失败，请在原始 JSON 视图中手动选择。"); }
-  }
-
-  async function copyPrompt(prompt: string) {
-    try { await navigator.clipboard.writeText(prompt); setNotice("完整 prompt_zh 已复制。"); }
-    catch { setError("复制失败，请手动选择提示词文本。"); }
-  }
-
-  async function loadDebugStage(stage: DebugStage) {
-    setDebugStage(stage); setDebugResult(null); setDebugError(""); setDebugLoading(true);
-    try {
-      const response = await fetch(`${API_BASE}/v1/demo/debug/${stage}?tier=${tier}`, { cache: "no-store" });
-      const data = await readJson<DebugResponse>(response);
-      if (!response.ok) throw new Error(data.detail || `调试环节加载失败（HTTP ${response.status}）`);
-      setDebugResult(data);
-    } catch (caught) {
-      setDebugError(caught instanceof Error ? caught.message : "调试环节加载失败");
-    } finally { setDebugLoading(false); }
-  }
+    return () => {
+      cancelled = true;
+    };
+    // 初始化只需执行一次，版本刷新函数内部只使用稳定的 setState。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function refreshAssetRegistry() {
     try {
       const response = await fetch(`${API_BASE}/v1/workflow/assets`, { cache: "no-store" });
-      const data = await readJson<AssetRegistryResponse>(response);
+      const data = await readJson<{ assets?: Record<string, AssetRecord>; detail?: string }>(response);
       if (!response.ok) throw new Error(data.detail || "资产登记表读取失败");
       setAssetRegistry(data.assets || {});
     } catch (caught) {
-      setWorkflowError(caught instanceof Error ? caught.message : "资产登记表读取失败");
+      setError(caught instanceof Error ? caught.message : "资产登记表读取失败");
     }
   }
 
-  function resetWorkflowMessage() {
-    setWorkflowError("");
-    setWorkflowNotice("");
+  function updateParam<K extends keyof ProjectParams>(key: K, value: ProjectParams[K]) {
+    setProjectParams((current) => ({ ...current, [key]: value }));
+    if (key === "routing_tier" || key === "resolution") {
+      setRouteResult(null);
+      setSubmitResult(null);
+      setComposeResult(null);
+    }
   }
 
-  async function seedWorkflowAssets() {
-    resetWorkflowMessage(); setWorkflowBusy("seed");
+  function resetMessages() {
+    setNotice("");
+    setError("");
+  }
+
+  function setPromptTemplateContent(name: PromptTemplateName, content: string, selectedVersion = "") {
+    if (name === "asset-split") setAssetPrompt(content);
+    if (name === "asset-prompts") setAssetPromptGenerationPrompt(content);
+    if (name === "storyboard-split") setStoryboardPrompt(content);
+    if (name === "shot-group-analysis") setAnalysisPrompt(content);
+    setSelectedPromptVersions((current) => ({ ...current, [name]: selectedVersion }));
+  }
+
+  async function refreshPromptVersions(name: PromptTemplateName) {
     try {
-      const response = await fetch(`${API_BASE}/v1/workflow/assets/seed-demo`, { method: "POST" });
-      const data = await readJson<{ seeded_count?: number; detail?: string }>(response);
-      if (!response.ok) throw new Error(data.detail || "内置资产登记失败");
-      await refreshAssetRegistry();
-      setWorkflowNotice(`已登记 ${data.seeded_count || 0} 张内置图片资产，可继续逐镜生成站位图。`);
-    } catch (caught) { setWorkflowError(caught instanceof Error ? caught.message : "内置资产登记失败"); }
-    finally { setWorkflowBusy(""); }
+      const response = await fetch(`${API_BASE}/v1/autoflow/prompts/${name}/versions`, { cache: "no-store" });
+      const data = await readJson<{ versions?: PromptVersion[]; detail?: string }>(response);
+      if (!response.ok) throw new Error(data.detail || "提示词版本列表读取失败");
+      setPromptVersions((current) => ({ ...current, [name]: data.versions || [] }));
+    } catch {
+      setPromptVersions((current) => ({ ...current, [name]: [] }));
+    }
   }
 
-  async function uploadWorkflowAsset(assetId: string, file: File) {
-    resetWorkflowMessage(); setWorkflowBusy(`upload:${assetId}`);
+  async function refreshAllPromptVersions() {
+    await Promise.all(PROMPT_TEMPLATE_NAMES.map((name) => refreshPromptVersions(name)));
+  }
+
+  async function saveCurrentPromptTemplate(name: PromptTemplateName, content: string) {
+    const data = await savePromptTemplate(name, content);
+    await refreshPromptVersions(name);
+    if (data.version) {
+      setSelectedPromptVersions((current) => ({ ...current, [name]: data.version || "" }));
+    }
+    return data;
+  }
+
+  async function selectPromptVersion(name: PromptTemplateName, version: string) {
+    if (!version) {
+      setSelectedPromptVersions((current) => ({ ...current, [name]: "" }));
+      return;
+    }
+    resetMessages();
+    try {
+      const response = await fetch(`${API_BASE}/v1/autoflow/prompts/${name}/versions/${version}`, { cache: "no-store" });
+      const data = await readJson<{ content?: string; detail?: string }>(response);
+      if (!response.ok || !data.content) throw new Error(data.detail || "提示词版本读取失败");
+      setPromptTemplateContent(name, data.content.trim(), version);
+      setNotice(`已切换到提示词版本 ${version}`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "提示词版本读取失败");
+    }
+  }
+
+  function canOpenStep(step: FlowStep): boolean {
+    if (step === "split") return true;
+    if (step === "assetPrompts") return Boolean(assetResult || assetPromptResult);
+    if (step === "assets") return Boolean(assetPromptResult || splitResult);
+    if (step === "analysis") return Boolean(splitResult);
+    if (step === "routing") return Boolean(analysisResult);
+    if (step === "submit") return Boolean(routeResult);
+    if (step === "compose") return Boolean(submitResult);
+    return true;
+  }
+
+  function renderPromptLabel(name: PromptTemplateName, text: string) {
+    const versions = promptVersions[name] || [];
+    return (
+      <span className="promptLabelRow">
+        <span>{text}</span>
+        <select
+          className="promptVersionSelect"
+          value={selectedPromptVersions[name] || ""}
+          onChange={(event) => void selectPromptVersion(name, event.target.value)}
+          disabled={versions.length === 0 || backendOnline !== true}
+          title="选择历史提示词版本"
+        >
+          <option value="">历史版本</option>
+          {versions.map((item) => (
+            <option key={item.version} value={item.version}>{item.version}</option>
+          ))}
+        </select>
+      </span>
+    );
+  }
+
+  function assetPromptPreview(asset: AssetItem) {
+    return asset.asset_prompt || asset.localized_prompt || asset.prompt || asset.description || "等待生成生资产提示词";
+  }
+
+  function assetHasModelPrompts(asset: AssetItem) {
+    return Boolean(asset.image_prompts && Object.keys(asset.image_prompts).length > 0);
+  }
+
+  function openAssetPromptPreview(asset: AssetItem) {
+    const firstVariant = Object.keys(asset.image_prompts || {})[0] || "";
+    setAssetPromptPreviewAsset(asset);
+    setAssetPromptPreviewVariant(firstVariant);
+  }
+
+  async function runAssetSplit(event?: FormEvent) {
+    event?.preventDefault();
+    resetMessages();
+    setBusy("assets-split");
+    setAssetResult(null);
+    setAssetPromptResult(null);
+    setSplitResult(null);
+    setAnalysisResult(null);
+    setRouteResult(null);
+    setSubmitResult(null);
+    setComposeResult(null);
+    try {
+      await saveCurrentPromptTemplate("asset-split", assetPrompt);
+      const response = await fetch(`${API_BASE}/v1/autoflow/assets/split`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_params: projectParams,
+          script,
+          asset_prompt: assetPrompt,
+          image_models: ["gpt_image_2", "seedream_4", "flux_kontext"],
+          use_ai: true,
+        }),
+      });
+      const data = await readJson<AssetSplitResponse>(response);
+      if (!response.ok) throw new Error(data.detail || "识别资产失败");
+      setAssetResult(data);
+      setActiveStep("assetPrompts");
+      const llm = data.llm as { provider?: string; model?: string } | undefined;
+      const modelLabel = llm?.provider ? `已调用 ${llm.provider}${llm.model ? ` / ${llm.model}` : ""}。` : "";
+      setNotice(`${modelLabel}资产识别完成：${data.assets.characters.length} 个角色、${data.assets.scenes.length} 个场景、${data.assets.items.length} 个物品。请继续生成生资产提示词。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "识别资产失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function loadLatestAssetSplit() {
+    resetMessages();
+    setBusy("assets-load");
+    setAssetPromptResult(null);
+    setSplitResult(null);
+    setAnalysisResult(null);
+    setRouteResult(null);
+    setSubmitResult(null);
+    setComposeResult(null);
+    try {
+      const response = await fetch(`${API_BASE}/v1/autoflow/assets/latest`, { cache: "no-store" });
+      const data = await readJson<AssetSplitResponse>(response);
+      if (!response.ok) throw new Error(data.detail || "加载最近资产识别结果失败");
+      setAssetResult(data);
+      if (assetsHaveGeneratedPrompts(data)) {
+        setAssetPromptResult(data);
+        setActiveStep("assets");
+        setNotice(`已加载最近资产提示词结果：${data.assets.characters.length} 个角色、${data.assets.scenes.length} 个场景、${data.assets.items.length} 个物品。`);
+      } else {
+        setAssetPromptResult(null);
+        setActiveStep("assetPrompts");
+        setNotice(`已加载最近资产识别结果：${data.assets.characters.length} 个角色、${data.assets.scenes.length} 个场景、${data.assets.items.length} 个物品，请继续生成生资产提示词。`);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "加载最近资产识别结果失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function loadLatestAssetPrompts() {
+    resetMessages();
+    setBusy("asset-prompts-load");
+    setSplitResult(null);
+    setAnalysisResult(null);
+    setRouteResult(null);
+    setSubmitResult(null);
+    setComposeResult(null);
+    try {
+      const response = await fetch(`${API_BASE}/v1/autoflow/assets/prompts/latest`, { cache: "no-store" });
+      const data = await readJson<AssetPromptResponse>(response);
+      if (!response.ok) throw new Error(data.detail || "加载最近资产提示词结果失败");
+      setAssetResult(data);
+      setAssetPromptResult(data);
+      setActiveStep("assets");
+      setNotice(`已加载最近资产提示词结果：${data.assets.characters.length} 个角色、${data.assets.scenes.length} 个场景、${data.assets.items.length} 个物品，可继续拆分镜。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "加载最近资产提示词结果失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function runAssetPrompts() {
+    if (!assetResult) {
+      setError("请先完成资产识别，再生成生资产提示词。");
+      return;
+    }
+    resetMessages();
+    setBusy("asset-prompts");
+    setAssetPromptResult(null);
+    setSplitResult(null);
+    setAnalysisResult(null);
+    setRouteResult(null);
+    setSubmitResult(null);
+    setComposeResult(null);
+    try {
+      await saveCurrentPromptTemplate("asset-prompts", assetPromptGenerationPrompt);
+      const response = await fetch(`${API_BASE}/v1/autoflow/assets/prompts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_params: projectParams,
+          script,
+          assets: assetResult.assets,
+          asset_ledger: assetResult.asset_ledger || null,
+          story_context: assetResult.story_context,
+          prompt_instruction: assetPromptGenerationPrompt,
+          image_models: ["gpt_image_2", "seedream_4", "flux_kontext"],
+          use_ai: true,
+        }),
+      });
+      const data = await readJson<AssetPromptResponse>(response);
+      if (!response.ok) throw new Error(data.detail || "生资产提示词生成失败");
+      setAssetPromptResult(data);
+      setActiveStep("assets");
+      const llm = data.llm as { provider?: string; model?: string } | undefined;
+      const modelLabel = llm?.provider ? `已调用 ${llm.provider}${llm.model ? ` / ${llm.model}` : ""}。` : "";
+      setNotice(`${modelLabel}生资产提示词完成：${data.assets.characters.length} 个角色、${data.assets.scenes.length} 个场景、${data.assets.items.length} 个物品。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "生资产提示词生成失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function runStoryboardSplit() {
+    if (!assetPromptResult) {
+      setError("请先生成生资产提示词，再拆分镜。");
+      return;
+    }
+    resetMessages();
+    setBusy("storyboard-split");
+    setSplitResult(null);
+    setAnalysisResult(null);
+    setRouteResult(null);
+    setSubmitResult(null);
+    setComposeResult(null);
+    try {
+      await saveCurrentPromptTemplate("storyboard-split", storyboardPrompt);
+      const response = await fetch(`${API_BASE}/v1/autoflow/storyboard/split`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_params: projectParams,
+          script,
+          assets: assetPromptResult.assets,
+          story_context: assetPromptResult.story_context,
+          storyboard_prompt: storyboardPrompt,
+          use_ai: true,
+        }),
+      });
+      const data = await readJson<SplitResponse>(response);
+      if (!response.ok) throw new Error(data.detail || "拆镜失败");
+      setSplitResult(data);
+      await refreshAssetRegistry();
+      setActiveStep("analysis");
+      const llm = data.llm as { provider?: string; model?: string } | undefined;
+      const modelLabel = llm?.provider ? `已调用 ${llm.provider}${llm.model ? ` / ${llm.model}` : ""}。` : "";
+      setNotice(`${modelLabel}拆分镜完成：${data.segments.length} 个分镜，可进入镜头组分析。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "拆镜失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function loadLatestStoryboard() {
+    resetMessages();
+    setBusy("storyboard-load");
+    setAnalysisResult(null);
+    setRouteResult(null);
+    setSubmitResult(null);
+    setComposeResult(null);
+    try {
+      const response = await fetch(`${API_BASE}/v1/autoflow/storyboard/latest`, { cache: "no-store" });
+      const data = await readJson<SplitResponse>(response);
+      if (!response.ok) throw new Error(data.detail || "加载最近拆分镜结果失败");
+      setAssetResult({ assets: data.assets, story_context: data.story_context, llm: data.llm });
+      setAssetPromptResult({ assets: data.assets, story_context: data.story_context, llm: data.llm });
+      setSplitResult(data);
+      await refreshAssetRegistry();
+      setActiveStep("analysis");
+      setNotice(`已加载最近拆分镜结果：${data.segments.length} 个分镜，可继续镜头组分析。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "加载最近拆分镜结果失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function uploadAsset(assetId: string, file: File) {
+    resetMessages();
+    setBusy(`upload:${assetId}`);
     try {
       const response = await fetch(`${API_BASE}/v1/workflow/assets/upload?asset_id=${encodeURIComponent(assetId)}`, {
         method: "POST",
@@ -382,217 +624,582 @@ export default function Home() {
         body: file,
       });
       const data = await readJson<AssetRecord & { detail?: string }>(response);
-      if (!response.ok) throw new Error(data.detail || `上传失败（HTTP ${response.status}）`);
+      if (!response.ok) throw new Error(data.detail || "上传图片失败");
       await refreshAssetRegistry();
-      setWorkflowNotice(`“${assetId}”已绑定到 ${file.name}。`);
-    } catch (caught) { setWorkflowError(caught instanceof Error ? caught.message : "图片上传失败"); }
-    finally { setWorkflowBusy(""); }
+      setNotice(`${assetId} 已绑定到 ${file.name}`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "上传图片失败");
+    } finally {
+      setBusy("");
+    }
   }
 
-  async function generateReferenceShot() {
-    if (!selectedWorkflowShot) return;
-    resetWorkflowMessage(); setWorkflowBusy("reference-one");
+  async function runAnalysis() {
+    if (!splitResult) return;
+    resetMessages();
+    setBusy("analysis");
+    setAnalysisResult(null);
+    setRouteResult(null);
+    setSubmitResult(null);
+    setComposeResult(null);
     try {
-      const response = await fetch(`${API_BASE}/v1/workflow/reference-images/generate-shot`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
+      await saveCurrentPromptTemplate("shot-group-analysis", analysisPrompt);
+      const response = await fetch(`${API_BASE}/v1/autoflow/analyze-shot-groups`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          episode_id: episodeId,
-          shot: selectedWorkflowShot,
-          demo_case: imageGenerationMode === "demo",
-          generation_mode: imageGenerationMode,
-          image_model: imageGenerationMode === "provider" ? imageModel : undefined,
+          project_params: projectParams,
+          assets,
+          story_context: storyContext,
+          segments,
+          analysis_prompt: analysisPrompt,
+          use_ai: true,
         }),
       });
-      const data = await readJson<ReferenceManifest & { detail?: string }>(response);
-      if (!response.ok) throw new Error(data.detail || "站位图生成失败");
-      if (data.shot_id) setReferenceManifests((current) => ({ ...current, [data.shot_id || ""]: data }));
-      await refreshAssetRegistry();
-      setWorkflowNotice(imageGenerationMode === "provider"
-        ? `${data.shot_id} 已用分镜 JSON 提示词调用 ${imageModel}，开始/结束站位图已生成并登记。`
-        : `${data.shot_id} 的 Demo 占位站位图已登记。`);
-    } catch (caught) { setWorkflowError(caught instanceof Error ? caught.message : "站位图生成失败"); }
-    finally { setWorkflowBusy(""); }
+      const data = await readJson<AnalysisResponse>(response);
+      if (!response.ok) throw new Error(data.detail || "镜头组分析失败");
+      setAnalysisResult(data);
+      setActiveStep("routing");
+      setNotice(`分析完成：形成 ${data.shot_groups.length} 个镜头组。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "镜头组分析失败");
+    } finally {
+      setBusy("");
+    }
   }
 
-  async function generateAllReferenceShots() {
-    if (!compiled?.final_video_plan) return;
-    resetWorkflowMessage(); setWorkflowBusy("reference-all"); setReferenceBulk(null);
+  async function loadLatestAnalysis() {
+    resetMessages();
+    setBusy("analysis-load");
+    setRouteResult(null);
+    setSubmitResult(null);
+    setComposeResult(null);
     try {
-      const response = await fetch(`${API_BASE}/v1/workflow/reference-images/generate-all`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ episode_id: episodeId, final_video_plan: compiled.final_video_plan }),
+      const response = await fetch(`${API_BASE}/v1/autoflow/analyze-shot-groups/latest`, { cache: "no-store" });
+      const data = await readJson<AnalysisResponse>(response);
+      if (!response.ok) throw new Error(data.detail || "加载最近镜头组分析结果失败");
+      if (data.assets && data.story_context && data.segments) {
+        setAssetResult({ assets: data.assets, story_context: data.story_context, llm: data.llm });
+        setAssetPromptResult({ assets: data.assets, story_context: data.story_context, llm: data.llm });
+        setSplitResult({ assets: data.assets, story_context: data.story_context, segments: data.segments, llm: data.llm });
+      }
+      setAnalysisResult(data);
+      setActiveStep("routing");
+      setNotice(`已加载最近镜头组分析结果：${data.shot_groups.length} 个镜头组，可继续路由与首尾帧。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "加载最近镜头组分析结果失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function runRoutingAndReferences() {
+    if (!splitResult || !analysisResult) return;
+    resetMessages();
+    setBusy("routing");
+    setRouteResult(null);
+    setSubmitResult(null);
+    setComposeResult(null);
+    try {
+      const response = await fetch(`${API_BASE}/v1/autoflow/route-and-generate-refs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_params: projectParams,
+          assets,
+          story_context: splitResult.story_context,
+          shot_groups: shotGroups,
+          generation_mode: generationMode,
+          image_model: generationMode === "provider" ? imageModel : undefined,
+        }),
       });
-      const data = await readJson<ReferenceBulkResponse>(response);
-      if (!response.ok) throw new Error(data.detail || "批量站位图生成失败");
-      setReferenceBulk(data);
-      const indexed: Record<string, ReferenceManifest> = {};
-      for (const manifest of data.completed || []) if (manifest.shot_id) indexed[manifest.shot_id] = manifest;
-      setReferenceManifests((current) => ({ ...current, ...indexed }));
+      const data = await readJson<RouteResponse>(response);
+      if (!response.ok) throw new Error(data.detail || "路由或首尾帧生成失败");
+      setRouteResult(data);
       await refreshAssetRegistry();
-      setWorkflowNotice(`站位图完成 ${data.completed_count || 0} 镜，阻塞 ${data.blocked_count || 0} 镜。`);
-    } catch (caught) { setWorkflowError(caught instanceof Error ? caught.message : "批量站位图生成失败"); }
-    finally { setWorkflowBusy(""); }
+      setActiveStep("submit");
+      setNotice(`路由完成：${data.final_video_plan?.shots?.length || 0} 个视频镜头；首尾帧完成 ${data.reference_generation?.completed_count || 0}，阻塞 ${data.reference_generation?.blocked_count || 0}。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "路由或首尾帧生成失败");
+    } finally {
+      setBusy("");
+    }
   }
 
-  async function runAutoBinding() {
-    if (!compiled?.final_video_plan) return;
-    resetWorkflowMessage(); setWorkflowBusy("binding"); setBindingResult(null);
+  async function runSubmit() {
+    if (!routeResult?.final_video_plan) return;
+    resetMessages();
+    setBusy("submit");
+    setSubmitResult(null);
+    setComposeResult(null);
     try {
-      const response = await fetch(`${API_BASE}/v1/workflow/bind`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ episode_id: episodeId, final_video_plan: compiled.final_video_plan }),
-      });
-      const data = await readJson<BindingResponse>(response);
-      if (!response.ok) throw new Error(data.detail || "资产绑定失败");
-      setBindingResult(data);
-      setWorkflowNotice(`自动绑定完成：可提交 ${data.ready_count || 0} 镜，阻塞 ${data.blocked_count || 0} 镜。`);
-    } catch (caught) { setWorkflowError(caught instanceof Error ? caught.message : "资产绑定失败"); }
-    finally { setWorkflowBusy(""); }
-  }
-
-  async function submitVideoJobs() {
-    if (!compiled?.final_video_plan) return;
-    resetWorkflowMessage(); setWorkflowBusy("submit"); setSubmitResult(null);
-    try {
-      const response = await fetch(`${API_BASE}/v1/workflow/video/submit`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ episode_id: episodeId, final_video_plan: compiled.final_video_plan }),
+      const response = await fetch(`${API_BASE}/v1/autoflow/video/submit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_params: projectParams, final_video_plan: routeResult.final_video_plan }),
       });
       const data = await readJson<SubmitResponse>(response);
       if (!response.ok) throw new Error(data.detail || "视频任务提交失败");
       setSubmitResult(data);
-      setWorkflowNotice(`已将 ${data.submitted_count || 0} 镜加入本地视频生成模拟队列；阻塞 ${data.blocked_count || 0} 镜。`);
-    } catch (caught) { setWorkflowError(caught instanceof Error ? caught.message : "视频任务提交失败"); }
-    finally { setWorkflowBusy(""); }
+      setActiveStep("compose");
+      setNotice(`视频任务提交完成：入队 ${data.submitted_count || 0}，阻塞 ${data.blocked_count || 0}。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "视频任务提交失败");
+    } finally {
+      setBusy("");
+    }
   }
 
-  return <main className="appShell">
-    <header className="topbar">
-      <div className="brand"><span className="brandMark">A</span><div><strong>镜序 · 导演台</strong><small>SHORT DRAMA DIRECTOR</small></div></div>
-      <div className="runtimeStatus"><span className={backendOnline ? "statusDot online" : "statusDot"} /><div><strong>{backendOnline === null ? "正在连接" : backendOnline ? "本地 Demo 已就绪" : "本地服务未连接"}</strong><small>内置 V7.3 结果 · 无 API 调用</small></div></div>
-    </header>
+  async function runCompose() {
+    if (!submitResult?.jobs?.length) return;
+    resetMessages();
+    setBusy("compose");
+    setComposeResult(null);
+    try {
+      const response = await fetch(`${API_BASE}/v1/autoflow/video/compose`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_params: projectParams, submit_result: submitResult, jobs: submitResult.jobs }),
+      });
+      const data = await readJson<ComposeResponse>(response);
+      if (!response.ok) throw new Error(data.detail || "视频合成失败");
+      setComposeResult(data);
+      setNotice(data.output_url ? `视频合成完成：${data.input_count || 0} 个分镜已合并。` : data.message || "没有可合成的视频文件。");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "视频合成失败");
+    } finally {
+      setBusy("");
+    }
+  }
 
-    <section className="hero"><div><p className="eyebrow">LOCAL DEMO / A JSON</p><h1>把整集剧本，变成可执行的导演结构。</h1></div><p className="heroCopy">当前为纯本地演示模式。A 阶段、拼接提示词和逐镜模型评分全部读取已验收的内置数据，不连接 OpenRouter，不产生费用。</p></section>
-
-    <form className="workbench" onSubmit={submit}>
-      <div className="inputColumn">
-        <section className="card promptCard">
-          <div className="cardHead"><div><span>01</span><div><h2>导演 Prompt</h2><p>Demo 中仅用于展示，不会发送给外部模型</p></div></div><button type="button" className="textButton" onClick={() => promptInfo && setDirectorPrompt(promptInfo.prompt)} disabled={!promptInfo}>恢复默认</button></div>
-          <textarea className="promptEditor" value={directorPrompt} onChange={(event) => setDirectorPrompt(event.target.value)} spellCheck={false} aria-label="导演 System Prompt" />
-          <div className="editorMeta"><span>{directorPrompt.length.toLocaleString("zh-CN")} 字符</span><span>内部输出 · {promptInfo?.internal_output_format || "A1c"}</span><span>Reasoning · {promptInfo?.reasoning_effort || "provider default"}</span></div>
-        </section>
-
-        <section className="card">
-          <div className="cardHead"><div><span>02</span><div><h2>项目参数</h2><p>导演层透传，不在这里选择视频模型</p></div></div><button type="button" className="textButton" onClick={() => void loadDemoInput()} disabled={!demoAvailable}>载入示例输入</button></div>
-          <div className="fieldGrid">
-            <label><span>集数 ID</span><input value={episodeId} onChange={(e) => setEpisodeId(e.target.value)} required /></label>
-            <label><span>项目类型</span><input value={projectType} onChange={(e) => setProjectType(e.target.value)} required /></label>
-            <label><span>画幅</span><select value={aspectRatio} onChange={(e) => setAspectRatio(e.target.value)}><option>9:16</option><option>16:9</option></select></label>
-            <label><span>目标分辨率</span><select value={resolution} onChange={(e) => setResolution(e.target.value)}><option>720P</option><option>1080P</option></select></label>
-            <label><span>路由档位</span><select value={tier} onChange={(e) => { setTier(e.target.value as RoutingTier); setCompiled(null); setDebugResult(null); }}><option value="low">LOW</option><option value="medium">MEDIUM</option><option value="high">HIGH</option></select></label>
-            <div className="toggleField"><span>连续性跟踪</span><button type="button" role="switch" aria-label="连续性跟踪" aria-checked={continuityTracking} className={continuityTracking ? "toggle on" : "toggle"} onClick={() => setContinuityTracking((value) => !value)}><i /></button></div>
+  return (
+    <main className="app-shell auto-flow-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <span className="brand-mark">帧</span>
+          <div>
+            <strong>镜序</strong>
+            <span>AI DIRECTOR</span>
           </div>
-          <label className="wideField"><span>全局视觉锁</span><input value={visualLock} onChange={(e) => setVisualLock(e.target.value)} placeholder="真人短剧、光影、色彩与质感" /></label>
-          <label className="wideField"><span>用户反馈 <em>可选</em></span><input value={feedback} onChange={(e) => setFeedback(e.target.value)} placeholder="例如：节奏更紧、表演更克制" /></label>
-        </section>
+        </div>
+        <StepTabs
+          steps={FLOW_STEPS}
+          activeStep={activeStep}
+          completedSteps={completedSteps}
+          canOpenStep={canOpenStep}
+          onChange={setActiveStep}
+        />
+        <div className="sidebar-foot">
+          <div className="engine-status"><span />{backendOnline === null ? "正在连接导演引擎" : backendOnline ? "导演引擎就绪" : "本地后端未连接"}</div>
+          <p>资产提示词 · 拆镜 · 首尾帧 · 视频生成 · 合成</p>
+          <button type="button">七步自动流 <span>›</span></button>
+        </div>
+      </aside>
 
-        <section className="card assetScriptCard">
-          <div className="cardHead"><div><span>03</span><div><h2>资产与剧本</h2><p>资产只登记逻辑 ID，不需要 URL 或 file_id</p></div></div></div>
-          <div className="sourceGrid">
-            <label><span>注册资产 JSON</span><textarea value={assetsText} onChange={(e) => setAssetsText(e.target.value)} spellCheck={false} /></label>
-            <label><span>上一集连续性 JSON <em>可选</em></span><textarea value={continuityText} onChange={(e) => setContinuityText(e.target.value)} spellCheck={false} /></label>
+      <section className="workspace">
+        <header className="topbar">
+          <div>
+            <span className="eyebrow">AUTOFLOW / {projectParams.episode_id}</span>
+            <h1>{projectParams.episode_id} · {currentStep.title}</h1>
           </div>
-          <label className="wideField scriptField"><span>整集剧本</span><textarea value={script} onChange={(e) => setScript(e.target.value)} placeholder="Demo 可直接加载，不需要先粘贴剧本……" /></label>
+          <div className="top-actions">
+            <span className={backendOnline ? "save-state online-state" : "save-state offline-state"}><i />{backendOnline === null ? "连接中" : backendOnline ? "后端已就绪" : "后端未连接"}</span>
+            <button className="quiet-button" type="button" onClick={() => void refreshAssetRegistry()} disabled={Boolean(busy)}>刷新资产</button>
+            <button className="avatar" aria-label="用户菜单" type="button">OF</button>
+          </div>
+        </header>
+
+        <div className="progress-strip"><span style={{ width: `${progressPercent}%` }} /></div>
+
+        <section className="page-wrap autoFlowContent">
+          {activeStep !== "assetPrompts" && (
+            <div className="page-head autoPageHead">
+              <div>
+                <span>{currentStep.index}</span>
+                <div>
+                  <p>AI-VIDEO COMPATIBLE WORKFLOW</p>
+                  <h2>{currentStep.title}</h2>
+                </div>
+              </div>
+              <div className="page-head-actions autoHeroStats">
+                <span><b>{segments.length}</b> 分镜</span>
+                <span><b>{shotGroups.length}</b> 镜头组</span>
+                <span><b>{finalShots.length}</b> 视频镜头</span>
+              </div>
+            </div>
+          )}
+
+          {activeStep !== "assetPrompts" && (error || notice) && <div className={error ? "message error autoMessage" : "message success autoMessage"}>{error || notice}</div>}
+
+      {activeStep === "split" && (
+        <form className="autoStepGrid splitGrid" onSubmit={runAssetSplit}>
+          <section className="card">
+            <div className="cardHead">
+              <div><span>01</span><div><h2>剧本与资产识别提示词</h2><p>第一步只请求大模型识别角色、场景、关键道具，不生成生资产提示词。</p></div></div>
+            </div>
+            <label className="autoField">
+              <span>整集剧本</span>
+              <textarea value={script} onChange={(event) => setScript(event.target.value)} required />
+            </label>
+            <label className="autoField">
+              {renderPromptLabel("asset-split", "拆资产提示词")}
+              <textarea value={assetPrompt} onChange={(event) => setPromptTemplateContent("asset-split", event.target.value)} required />
+            </label>
+            <div className="splitActions">
+              <button className="generateButton autoPrimaryButton" type="submit" disabled={Boolean(busy) || backendOnline !== true || !assetPrompt.trim()}>
+                <span>{busy === "assets-split" ? "正在识别资产..." : "识别资产"}</span><b>→</b>
+              </button>
+              <button className="textButton" type="button" onClick={() => void loadLatestAssetSplit()} disabled={Boolean(busy) || backendOnline !== true}>
+                {busy === "assets-load" ? "正在加载..." : "加载最近识别结果"}
+              </button>
+            </div>
+          </section>
+
+          <section className="card">
+            <div className="cardHead">
+              <div><span>参数</span><div><h2>项目参数</h2><p>作为自动流全局约束透传给后端。</p></div></div>
+            </div>
+            <div className="autoParamGrid">
+              <label><span>集数 ID</span><input value={projectParams.episode_id} onChange={(e) => updateParam("episode_id", e.target.value)} /></label>
+              <label><span>项目类型</span><input value={projectParams.project_type} onChange={(e) => updateParam("project_type", e.target.value)} /></label>
+              <label><span>画幅</span><select value={projectParams.aspect_ratio} onChange={(e) => updateParam("aspect_ratio", e.target.value)}><option>9:16</option><option>16:9</option></select></label>
+              <label><span>分辨率</span><select value={projectParams.resolution} onChange={(e) => updateParam("resolution", e.target.value)}><option>720P</option><option>1080P</option></select></label>
+              <label><span>路由档位</span><select value={projectParams.routing_tier} onChange={(e) => updateParam("routing_tier", e.target.value as RoutingTier)}><option value="low">LOW</option><option value="medium">MEDIUM</option><option value="high">HIGH</option></select></label>
+            </div>
+            <label className="autoField"><span>全局视觉锁</span><input value={projectParams.global_visual_lock} onChange={(e) => updateParam("global_visual_lock", e.target.value)} /></label>
+            <label className="autoField"><span>用户反馈</span><input value={projectParams.feedback} onChange={(e) => updateParam("feedback", e.target.value)} placeholder="可选" /></label>
+            {(assetResult || splitResult) && (
+              <pre className="autoJsonPreview">
+                {JSON.stringify(
+                  {
+                    assets,
+                    story_context: storyContext,
+                    segments: splitResult?.segments.slice(0, 2) || [],
+                  },
+                  null,
+                  2,
+                )}
+              </pre>
+            )}
+          </section>
+        </form>
+      )}
+
+      {activeStep === "assetPrompts" && (
+        <section className="assetCenterPage">
+          <div className="assetCenterHero">
+            <div>
+              <span>02 / {assetPromptCards.length} ASSETS READY</span>
+              <h2>资产中心</h2>
+              <p>按图示卡片管理已识别资产，并通过生资产提示词模板补齐多模型提示词。</p>
+            </div>
+            <div className="autoInlineActions">
+              <button type="button" className="textButton" onClick={() => void loadLatestAssetPrompts()} disabled={Boolean(busy) || backendOnline !== true}>
+                {busy === "asset-prompts-load" ? "正在加载..." : "加载最近资产提示词"}
+              </button>
+              <button type="button" className="textButton" onClick={() => void refreshAssetRegistry()} disabled={Boolean(busy)}>刷新资产</button>
+              <button type="button" className="textButton" onClick={() => setActiveStep("assets")} disabled={!assetPromptResult}>下一步：拆分镜</button>
+            </div>
+          </div>
+
+          {(error || notice) && <div className={error ? "message error autoMessage assetCenterMessage" : "message success autoMessage assetCenterMessage"}>{error || notice}</div>}
+
+          <details className="assetTemplateDrawer">
+            <summary>生资产提示词模板</summary>
+            <label className="autoField">
+              {renderPromptLabel("asset-prompts", "模板内容")}
+              <textarea value={assetPromptGenerationPrompt} onChange={(event) => setPromptTemplateContent("asset-prompts", event.target.value)} required />
+            </label>
+          </details>
+
+          <div className="assetCenterToolbar">
+            <div className="assetFilterTabs">
+              <button type="button" className={assetPromptFilter === "all" ? "active" : ""} onClick={() => setAssetPromptFilter("all")}>全部 {assetPromptCards.length}</button>
+              <button type="button" className={assetPromptFilter === "characters" ? "active" : ""} onClick={() => setAssetPromptFilter("characters")}>角色 {assetPromptAssets.characters.length}</button>
+              <button type="button" className={assetPromptFilter === "scenes" ? "active" : ""} onClick={() => setAssetPromptFilter("scenes")}>场景 {assetPromptAssets.scenes.length}</button>
+              <button type="button" className={assetPromptFilter === "items" ? "active" : ""} onClick={() => setAssetPromptFilter("items")}>道具 {assetPromptAssets.items.length}</button>
+            </div>
+            <p><i />输出每个资产的生图提示词，供下一步拆分镜和资产生成使用。</p>
+          </div>
+
+          <div className="assetCenterGrid">
+            {filteredAssetPromptCards.map(({ asset, key, label, glyph }) => {
+              const record = assetRegistry[asset.id];
+              return (
+                <article className={record ? "assetCenterCard bound" : "assetCenterCard"} key={`${key}:${asset.id}`}>
+                  <div className="assetCenterPreview">
+                    <b>{label}</b>
+                    {record?.url ? <div className="assetCenterImage" style={{ backgroundImage: `url(${API_BASE}${record.url})` }} aria-label={asset.name} /> : <span>{glyph}</span>}
+                    <small>{record ? "素材已绑定" : "等待素材"}</small>
+                  </div>
+                  <div className="assetCenterCopy">
+                    <strong>{asset.name}</strong>
+                    <em>{asset.id}</em>
+                    <p>{assetPromptPreview(asset)}</p>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+
+          <div className="assetCenterActionBar">
+            <div><strong>{readyAssetCount} 个资产已配置素材</strong><span>生成提示词后可进入第 3 步拆分镜。</span></div>
+            <button className="textButton" type="button" onClick={() => void refreshAssetRegistry()} disabled={Boolean(busy)}>检查缺失资产</button>
+            <button className="generateButton" type="button" onClick={() => void runAssetPrompts()} disabled={Boolean(busy) || !assetResult || backendOnline !== true || !assetPromptGenerationPrompt.trim()}>
+              <span>{busy === "asset-prompts" ? "正在生成生资产提示词..." : "确认资产并生成提示词"}</span><b>→</b>
+            </button>
+          </div>
+
+          {assetPromptResult && <pre className="autoJsonPreview">{JSON.stringify({ assets: assetPromptResult.assets, story_context: assetPromptResult.story_context }, null, 2)}</pre>}
         </section>
+      )}
 
-        {(error || notice) && <div className={error ? "message error" : "message success"}>{error || notice}</div>}
-        <button className="generateButton" type="submit" disabled={running || backendOnline !== true || !demoAvailable}><span>{running ? phase === "director" ? `正在加载内置 A 阶段 · ${elapsed}s` : `正在加载提示词与评分 · ${elapsed}s` : demoAvailable ? "加载 Demo A 阶段结果" : "内置 Demo 不可用"}</span><b>{running ? "•••" : "↗"}</b></button>
-        <p className="securityNote">纯本地 Demo：不读取 API Key，不发送资产或剧本，不产生模型费用。</p>
-      </div>
+      {activeStep === "assets" && (
+        <section className="assetCenterPage">
+          <div className="assetCenterHero">
+            <div>
+              <span>03 / {assetPromptCards.length} ASSETS PROMPTED</span>
+              <h2>资产提示词确认</h2>
+              <p>检查每个资产的提示词结果，再基于拆分镜模板生成分镜与子镜头。</p>
+            </div>
+            <div className="autoInlineActions">
+              <button type="button" className="textButton" onClick={() => void loadLatestStoryboard()} disabled={Boolean(busy) || backendOnline !== true}>
+                {busy === "storyboard-load" ? "正在加载..." : "加载最近拆分镜"}
+              </button>
+              <button type="button" className="textButton" onClick={() => void refreshAssetRegistry()} disabled={Boolean(busy)}>刷新资产</button>
+              <button type="button" className="textButton" onClick={() => setActiveStep("analysis")} disabled={!splitResult}>下一步：镜头组分析</button>
+            </div>
+          </div>
 
-      <section className="card outputCard" aria-live="polite">
-        <div className="cardHead outputHead"><div><span>04</span><div><h2>{compiled ? "拼接提示词与评分" : "A 阶段结果"}</h2><p>{result ? `${shots.length} 个原子分镜` : "等待导演输出"}</p></div></div>{result && <div className="outputActions"><button type="button" onClick={() => void copyResult()}>复制 A JSON</button><button type="button" onClick={() => saveFile(`${episodeId}_A导演输出.json`, jsonOutput)}>下载 A</button>{compiled?.final_video_plan && <button type="button" onClick={() => saveFile(`${episodeId}_${tier}_final_video_plan.json`, JSON.stringify(compiled.final_video_plan, null, 2))}>下载 Final</button>}</div>}</div>
-        {!result && !running && <div className="emptyState"><div className="emptyIndex">A</div><h3>导演结构将在这里展开</h3><p>输出包括场景空间母版、原子分镜、镜头语言、比例锁、逻辑素材、能力需求、连续性与剪辑交接合同。</p></div>}
-        {running && !result && <div className="emptyState runningState"><div className="orbit"><i /><span>A</span></div><h3>正在加载内置导演结构</h3><p>所有数据均来自本地已验收 Demo，不会请求外部模型。</p><div className="progressLine"><i /></div></div>}
-        {result && <div className="resultBody">
-          <div className="resultTabs"><button type="button" className={resultMode === "overview" ? "active" : ""} onClick={() => setResultMode("overview")}>{compiled ? "拼接提示词与评分" : "A 分镜概览"}</button><button type="button" className={resultMode === "json" ? "active" : ""} onClick={() => setResultMode("json")}>A 阶段 JSON</button></div>
-          {!compiled && !running && <div className="nextStepPanel"><div><small>STEP 02</small><strong>Demo A 阶段已就绪</strong><p>直接读取内置 {tier.toUpperCase()} 档的完整 prompt_zh 和每镜候选模型评分。</p></div><button type="button" onClick={() => void compileNext()}>下一步：查看拼接提示词和评分 <b>→</b></button></div>}
-          {running && phase === "routing" && <div className="routingBanner"><i /><span>导演分镜已完成，正在计算当前档位的模型候选评分…</span></div>}
-          {resultMode === "overview" ? <><div className="metrics"><div><small>原子镜头</small><strong>{shots.length}</strong></div><div><small>场景上下文</small><strong>{result.director_plan.scene_contexts?.length || 0}</strong></div><div><small>预计总时长</small><strong>{totalDuration}s</strong></div><div><small>导演档位</small><strong>{result.director_plan.routing_tier?.toUpperCase() || tier.toUpperCase()}</strong></div></div>
-            <div className="shotList">{shots.map((shot, index) => {
-              const route = shot.atomic_id ? routingByAtomic.get(shot.atomic_id) : undefined;
-              const decision = route?.routing_decision;
-              const finalShot = route?.shot_id ? finalById.get(route.shot_id) : undefined;
-              return <details key={shot.atomic_id || index} className="shotCard" open={index === 0}><summary><div><span>{String(index + 1).padStart(2, "0")}</span><strong>{shot.atomic_id || `shot-${index + 1}`}</strong></div><div className="shotBadges"><i>{shot.story_priority || "normal"}</i><i>{shot.narrative_class || "—"}</i>{decision?.selected_model && <i className="modelBadge">{decision.selected_display_name || decision.selected_model} · {decision.selected_preset}</i>}<b>{shot.atomic_duration || 0}s</b></div></summary><div className="shotDetail"><div className="shotFact"><small>叙事功能</small><p>{shot.narrative_function || "—"}</p></div><div className="shotFact"><small>场景资产</small><p>{shot.scene_asset || "—"}</p></div><div className="shotFact full"><small>本地时间轴</small><p>{shot.prompt_core?.timeline_local || "—"}</p></div><div className="shotFact full"><small>连续性</small><p>{shot.continuity ? `${shot.continuity.entry || "—"} → ${shot.continuity.exit || "—"}` : "—"}</p></div>
-                {finalShot?.prompt_zh && <section className="compiledPrompt"><div><span>拼接完成的 prompt_zh</span><button type="button" onClick={() => void copyPrompt(finalShot.prompt_zh || "")}>复制提示词</button></div><pre>{finalShot.prompt_zh}</pre></section>}
-                {decision ? <section className="routingPanel">
-                  <div className="routingWinner"><div><small>最终选择</small><strong>{decision.selected_display_name || decision.selected_model}</strong><span>{decision.selected_preset}</span></div><div className="winnerMetrics"><span>质量 <b>{decision.fit_quality?.toFixed(2)}</b></span><span>可靠性 <b>{((decision.reliability || 0) * 100).toFixed(1)}%</b></span><span>预计可用积分 <b>{decision.expected_usable_points?.toFixed(2)}</b></span></div></div>
-                  <p className="selectionReason">{selectedReason(decision)}</p>
-                  <div className="scoreTableWrap"><table className="scoreTable"><thead><tr><th>模型 / Preset</th><th>准入</th><th>质量分</th><th>可靠性</th><th>调用积分</th><th>预计可用积分</th><th>档位分</th><th>结论</th></tr></thead><tbody>{(decision.candidates || []).map((candidate, candidateIndex) => <tr key={`${candidate.model}-${candidate.preset}-${candidateIndex}`} className={candidate.selected ? "selectedRow" : !candidate.qualified ? "invalidRow" : ""}><td><strong>{candidate.model}</strong><small>{candidate.preset}</small></td><td><span className={candidate.qualified ? "qualify yes" : "qualify no"}>{candidate.qualified ? "通过" : "淘汰"}</span></td><td><div className="scoreCell"><b>{candidate.fit_quality?.toFixed(2) || "—"}</b><i style={{ width: `${Math.max(0, Math.min(100, candidate.fit_quality || 0))}%` }} /></div></td><td>{candidate.reliability === undefined ? "—" : `${(candidate.reliability * 100).toFixed(1)}%`}</td><td>{candidate.call_points?.toFixed(2) || "—"}</td><td>{candidate.expected_usable_points?.toFixed(2) || "—"}</td><td>{candidate.tier_score?.toFixed(2) || "—"}</td><td className="reasonCell">{candidateReason(candidate)}</td></tr>)}</tbody></table></div>
-                </section> : compiled ? <div className="routingPending">当前分镜没有匹配到路由结果</div> : null}
-              </div></details>;
-            })}</div></> : <pre className="jsonView">{jsonOutput}</pre>}
-        </div>}
+          {(error || notice) && <div className={error ? "message error autoMessage assetCenterMessage" : "message success autoMessage assetCenterMessage"}>{error || notice}</div>}
+
+          <details className="assetTemplateDrawer">
+            <summary>拆分镜提示词模板</summary>
+            <label className="autoField">
+              {renderPromptLabel("storyboard-split", "拆分镜提示词")}
+              <textarea value={storyboardPrompt} onChange={(event) => setPromptTemplateContent("storyboard-split", event.target.value)} required />
+            </label>
+          </details>
+
+          <div className="assetCenterToolbar">
+            <div className="assetFilterTabs">
+              <button type="button" className={assetPromptFilter === "all" ? "active" : ""} onClick={() => setAssetPromptFilter("all")}>全部 {assetPromptCards.length}</button>
+              <button type="button" className={assetPromptFilter === "characters" ? "active" : ""} onClick={() => setAssetPromptFilter("characters")}>角色 {assetPromptAssets.characters.length}</button>
+              <button type="button" className={assetPromptFilter === "scenes" ? "active" : ""} onClick={() => setAssetPromptFilter("scenes")}>场景 {assetPromptAssets.scenes.length}</button>
+              <button type="button" className={assetPromptFilter === "items" ? "active" : ""} onClick={() => setAssetPromptFilter("items")}>道具 {assetPromptAssets.items.length}</button>
+            </div>
+            <p><i />点击“资产提示词”查看该资产的三套候选，确认后进入拆分镜。</p>
+          </div>
+
+          <div className="assetCenterGrid">
+            {filteredAssetPromptCards.map(({ asset, key, label, glyph }) => {
+              const record = assetRegistry[asset.id];
+              const uploading = busy === `upload:${asset.id}`;
+              return (
+                <article className={record ? "assetCenterCard bound" : "assetCenterCard"} key={`storyboard:${key}:${asset.id}`}>
+                  <div className="assetCenterPreview">
+                    <b>{label}</b>
+                    {record?.url ? <div className="assetCenterImage" style={{ backgroundImage: `url(${API_BASE}${record.url})` }} aria-label={asset.name} /> : <span>{glyph}</span>}
+                    <small>{record ? "素材已绑定" : "等待素材"}</small>
+                  </div>
+                  <div className="assetCenterCopy">
+                    <strong>{asset.name}</strong>
+                    <em>{asset.id}</em>
+                    <p>{assetPromptPreview(asset)}</p>
+                  </div>
+                  <footer>
+                    <label>
+                      <input
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp"
+                        disabled={Boolean(busy)}
+                        onChange={(event) => {
+                          const file = event.target.files?.[0];
+                          if (file) uploadAsset(asset.id, file);
+                          event.currentTarget.value = "";
+                        }}
+                      />
+                      <span>{uploading ? "上传中" : record ? "替换图片" : "上传图片"}</span>
+                    </label>
+                    <button type="button" onClick={() => openAssetPromptPreview(asset)} disabled={!assetHasModelPrompts(asset)}>资产提示词</button>
+                  </footer>
+                </article>
+              );
+            })}
+          </div>
+
+          <div className="assetCenterActionBar">
+            <div><strong>{readyAssetCount} 个资产已配置素材</strong><span>资产提示词确认后，可提交拆分镜大模型分析。</span></div>
+            <button className="textButton" type="button" onClick={() => void refreshAssetRegistry()} disabled={Boolean(busy)}>检查缺失资产</button>
+            <button className="generateButton" type="button" onClick={() => void runStoryboardSplit()} disabled={Boolean(busy) || !assetPromptResult || backendOnline !== true}>
+              <span>{busy === "storyboard-split" ? "正在拆分镜..." : "基于资产拆分镜"}</span><b>→</b>
+            </button>
+          </div>
+
+          {splitResult && <pre className="autoJsonPreview">{JSON.stringify({ story_context: storyContext, segments: splitResult.segments.slice(0, 2) }, null, 2)}</pre>}
+        </section>
+      )}
+
+      {(activeStep === "assetPrompts" || activeStep === "assets") && assetPromptPreviewAsset && (
+        <div className="assetPromptModalBackdrop">
+          <button className="assetPromptModalCloseLayer" type="button" aria-label="关闭资产提示词弹窗" onClick={() => setAssetPromptPreviewAsset(null)} />
+          <section className="assetPromptModal" role="dialog" aria-modal="true" aria-label={`${assetPromptPreviewAsset.name} 资产提示词`}>
+            <header>
+              <div>
+                <span>{assetPromptPreviewAsset.id}</span>
+                <h3>{assetPromptPreviewAsset.name}</h3>
+                <p>{assetPromptPreviewAsset.asset_prompt || "以下为该资产的候选提示词。"}</p>
+              </div>
+              <button type="button" onClick={() => setAssetPromptPreviewAsset(null)}>关闭</button>
+            </header>
+            {(() => {
+              const promptEntries = Object.entries(assetPromptPreviewAsset.image_prompts || {});
+              const activeEntry = promptEntries.find(([variant]) => variant === assetPromptPreviewVariant) || promptEntries[0];
+              return (
+                <div className="assetPromptTabContent">
+                  <div className="assetPromptTabs">
+                    {promptEntries.map(([variant]) => (
+                      <button
+                        key={variant}
+                        type="button"
+                        className={activeEntry?.[0] === variant ? "active" : ""}
+                        onClick={() => setAssetPromptPreviewVariant(variant)}
+                      >
+                        {variant}
+                      </button>
+                    ))}
+                  </div>
+                  {activeEntry ? (
+                    <article className="assetPromptPanel">
+                      <strong>{activeEntry[0]}</strong>
+                      <p>{activeEntry[1]}</p>
+                    </article>
+                  ) : null}
+                </div>
+              );
+            })()}
+          </section>
+        </div>
+      )}
+
+      {activeStep === "analysis" && (
+        <section className="autoStepGrid analysisGrid">
+          <section className="card">
+            <div className="cardHead">
+              <div><span>04</span><div><h2>分析镜头组提示词</h2><p>识别连续拍摄、4秒拼接与独立镜头组。</p></div></div>
+            </div>
+            <label className="autoField analysisPrompt">
+              {renderPromptLabel("shot-group-analysis", "分析提示词")}
+              <textarea value={analysisPrompt} onChange={(event) => setPromptTemplateContent("shot-group-analysis", event.target.value)} />
+            </label>
+            <button className="generateButton autoPrimaryButton" type="button" onClick={() => void runAnalysis()} disabled={Boolean(busy) || !splitResult}>
+              <span>{busy === "analysis" ? "正在分析镜头组..." : "分析镜头组"}</span><b>→</b>
+            </button>
+            <button className="textButton" type="button" onClick={() => void loadLatestAnalysis()} disabled={Boolean(busy) || backendOnline !== true}>
+              {busy === "analysis-load" ? "正在加载..." : "加载最近镜头组分析"}
+            </button>
+            <ShotGroupAnalysisPanel groups={shotGroups} />
+          </section>
+          <section className="card">
+            <div className="cardHead">
+              <div><span>分镜</span><div><h2>分镜与子镜头</h2><p>展开分镜后可继续展开每个子镜头。</p></div></div>
+            </div>
+            <StoryboardAccordion segments={segments as Segment[]} />
+          </section>
+        </section>
+      )}
+
+      {activeStep === "routing" && (
+        <section className="card autoFullCard">
+          <div className="cardHead">
+            <div><span>05</span><div><h2>路由评分与首尾帧</h2><p>按第四步镜头组执行模型路由，并并行生成首帧和尾帧图片。</p></div></div>
+            <div className="autoInlineActions">
+              <select value={generationMode} onChange={(event) => setGenerationMode(event.target.value as GenerationMode)}>
+                <option value="demo">Demo 占位图</option>
+                <option value="provider">真实图片模型</option>
+              </select>
+              <input value={imageModel} onChange={(event) => setImageModel(event.target.value)} disabled={generationMode !== "provider"} />
+              <button type="button" className="textButton" onClick={() => void runRoutingAndReferences()} disabled={Boolean(busy) || !analysisResult}>
+                {busy === "routing" ? "路由与生图中..." : "执行路由 + 首尾帧"}
+              </button>
+            </div>
+          </div>
+          <RoutingResultPanel routingShots={routingShots} finalShots={finalShots} references={referenceMap} apiBase={API_BASE} />
+          {routeResult?.reference_generation?.blocked?.length ? (
+            <div className="workflowJsonSummary autoBlockedSummary">
+              <div><span>首尾帧阻塞</span><b>{routeResult.reference_generation.blocked_count || 0}</b></div>
+              <pre>{JSON.stringify(routeResult.reference_generation.blocked, null, 2)}</pre>
+            </div>
+          ) : null}
+        </section>
+      )}
+
+      {activeStep === "submit" && (
+        <section className="card autoFullCard">
+          <div className="cardHead">
+            <div><span>06</span><div><h2>视频生成</h2><p>提交镜头组路由方案、首尾帧图片、资产图片和分镜提示词，等待每个分镜视频输出。</p></div></div>
+            <button type="button" className="textButton" onClick={() => void runSubmit()} disabled={Boolean(busy) || !routeResult?.final_video_plan}>
+              {busy === "submit" ? "正在提交..." : "提交生成视频"}
+            </button>
+          </div>
+          <div className="submitSummary">
+            <div><small>视频镜头</small><strong>{finalShots.length}</strong></div>
+            <div><small>首尾帧完成</small><strong>{routeResult?.reference_generation?.completed_count || 0}</strong></div>
+            <div><small>视频入队</small><strong>{submitResult?.submitted_count || 0}</strong></div>
+            <div><small>阻塞</small><strong>{submitResult?.blocked_count || routeResult?.reference_generation?.blocked_count || 0}</strong></div>
+          </div>
+          <div className="submitShotList">
+            {finalShots.map((shot) => {
+              const manifest = shot.shot_id ? referenceMap[shot.shot_id] : undefined;
+              return (
+                <article key={shot.shot_id}>
+                  <header>
+                    <strong>{shot.shot_id}</strong>
+                    <span>{shot.model} · {shot.model_params?.resolution_preset}</span>
+                    <b>{shot.duration}s</b>
+                  </header>
+                  <p>{shot.prompt_zh}</p>
+                  <footer>
+                    <span>资产 {shot.references?.length || 0}</span>
+                    <span>首帧 {manifest?.entry?.asset_id || "未生成"}</span>
+                    <span>尾帧 {manifest?.exit?.asset_id || "未生成"}</span>
+                  </footer>
+                </article>
+              );
+            })}
+          </div>
+          {submitResult && <div className="workflowJsonSummary autoBlockedSummary"><div><span>提交结果</span><b>{submitResult.submitted_count || 0}</b></div><pre>{JSON.stringify(submitResult, null, 2)}</pre></div>}
+        </section>
+      )}
+
+      {activeStep === "compose" && (
+        <section className="card autoFullCard">
+          <div className="cardHead">
+            <div><span>07</span><div><h2>视频合成</h2><p>读取第六步 job 输出里的分镜视频路径，调用 ffmpeg 合并为完整视频。</p></div></div>
+            <button type="button" className="textButton" onClick={() => void runCompose()} disabled={Boolean(busy) || !submitResult?.jobs?.length}>
+              {busy === "compose" ? "正在合成..." : "ffmpeg 合成视频"}
+            </button>
+          </div>
+          <div className="submitSummary">
+            <div><small>视频任务</small><strong>{submitResult?.jobs?.length || 0}</strong></div>
+            <div><small>合成输入</small><strong>{composeResult?.input_count || 0}</strong></div>
+            <div><small>合成阻塞</small><strong>{composeResult?.blocked_count || 0}</strong></div>
+            <div><small>状态</small><strong>{composeResult?.status || "待合成"}</strong></div>
+          </div>
+          {composeResult?.output_url ? (
+            <div className="workflowJsonSummary autoBlockedSummary">
+              <div><span>合成视频</span><b>{composeResult.compose_id}</b></div>
+              <video src={`${API_BASE}${composeResult.output_url}`} controls>
+                <track kind="captions" label="暂无字幕" />
+              </video>
+              <a href={`${API_BASE}${composeResult.output_url}`} target="_blank" rel="noreferrer">打开合成视频</a>
+            </div>
+          ) : null}
+          {composeResult && <div className="workflowJsonSummary autoBlockedSummary"><div><span>合成结果</span><b>{composeResult.status || "blocked"}</b></div><pre>{JSON.stringify(composeResult, null, 2)}</pre></div>}
+        </section>
+      )}
+        </section>
       </section>
-    </form>
-
-    {result && !compiled && !running && <button type="button" className="floatingNextButton" onClick={() => void compileNext()}><span>下一步</span><strong>查看拼接提示词和评分</strong><b>→</b></button>}
-
-    <section className="card workflowCard">
-      <div className="cardHead debugHead"><div><span>06</span><div><h2>生成执行工作流</h2><p>模型路由之后，四个环节可独立上传、生成、绑定或提交</p></div></div><div className="demoPill">LOCAL DEMO · 不产生费用</div></div>
-      <div className="workflowStageBar">{WORKFLOW_STEPS.map((step) => <button type="button" key={step.id} className={workflowStep === step.id ? "active" : ""} onClick={() => { setWorkflowStep(step.id); resetWorkflowMessage(); }} disabled={!compiled}><i>{step.index}</i><span>{step.label}</span></button>)}</div>
-      {!compiled && <div className="debugEmpty"><strong>请先完成“下一步：查看拼接提示词和评分”</strong><p>模型路由完成后，这里会读取每个 final shot 的视频提示词、逻辑资产与站位图计划。</p>{result && <button type="button" className="emptyNextButton" onClick={() => void compileNext()} disabled={running}>{running ? "正在加载…" : "直接进入下一步 →"}</button>}</div>}
-      {compiled && <div className="workflowBody">
-        {(workflowError || workflowNotice) && <div className={workflowError ? "message error" : "message success"}>{workflowError || workflowNotice}</div>}
-
-        {workflowStep === "assets" && <>
-          <div className="workflowIntro"><div><small>STEP 06 / ASSET REGISTRY</small><h3>上传并绑定图片资产</h3><p>每个逻辑资产 ID 可独立替换图片。上传后，后续站位图与视频任务会自动读取同一份登记表。</p></div><button type="button" onClick={() => void seedWorkflowAssets()} disabled={Boolean(workflowBusy)}>{workflowBusy === "seed" ? "正在登记…" : "载入内置 Demo 图片"}</button></div>
-          <div className="workflowMetrics"><div><small>本计划图片资产</small><strong>{workflowAssets.length}</strong></div><div><small>已绑定</small><strong>{workflowAssets.filter((item) => assetRegistry[item.asset_id]).length}</strong></div><div><small>必需资产</small><strong>{workflowAssets.filter((item) => item.required).length}</strong></div><div><small>登记表总数</small><strong>{Object.keys(assetRegistry).length}</strong></div></div>
-          <div className="assetRows">{workflowAssets.map((item) => {
-            const binding = assetRegistry[item.asset_id];
-            const uploading = workflowBusy === `upload:${item.asset_id}`;
-            return <div className="assetRow" key={item.asset_id}><div className="assetIdentity"><span className={binding ? "assetState bound" : "assetState"}>{binding ? "已绑定" : "待上传"}</span><div><strong>{item.asset_id}</strong><small>{item.required ? "必需" : "可选"} · 被 {item.usedBy.length} 个分镜使用</small></div></div><div className="assetSource">{binding?.url ? <a href={`${API_BASE}${binding.url}`} target="_blank" rel="noreferrer">{binding.source === "user_upload" ? "用户图片" : binding.source === "bundled_demo_asset" ? "内置图片" : "查看图片"}</a> : <span>尚无文件</span>}<small>{binding?.original_filename ? decodeURIComponent(binding.original_filename) : "—"}</small></div><label className="uploadButton"><input type="file" accept="image/png,image/jpeg,image/webp" disabled={Boolean(workflowBusy)} onChange={(event) => { const file = event.target.files?.[0]; if (file) void uploadWorkflowAsset(item.asset_id, file); event.currentTarget.value = ""; }} /><span>{uploading ? "上传中…" : binding ? "替换图片" : "上传图片"}</span></label></div>;
-          })}</div>
-        </>}
-
-        {workflowStep === "references" && <>
-          <div className="workflowIntro"><div><small>STEP 07 / POSITION REFERENCES</small><h3>用逐镜 JSON 提示词生成开始与结束站位图</h3><p>开始图使用该镜 JSON 提示词和角色/场景/道具原图生成；结束图再以开始图为编辑底图。两张图作为普通图片参考绑定。</p></div><div className="workflowActions"><button type="button" onClick={() => void generateReferenceShot()} disabled={Boolean(workflowBusy) || (imageGenerationMode === "provider" && !imageGenerationConfig?.configured)}>{workflowBusy === "reference-one" ? "正在生成两张图…" : imageGenerationMode === "provider" ? "调用图片模型生成当前分镜" : "登记当前 Demo 占位图"}</button><button type="button" className="secondary" onClick={() => void generateAllReferenceShots()} disabled={Boolean(workflowBusy) || imageGenerationMode === "provider"}>{workflowBusy === "reference-all" ? "正在批量生成…" : imageGenerationMode === "provider" ? "真实模式请逐镜生成" : "登记全部 Demo 占位图"}</button></div></div>
-          <div className="generationModePanel"><div><span>图片来源模式</span><div><button type="button" className={imageGenerationMode === "demo" ? "active" : ""} onClick={() => setImageGenerationMode("demo")}>Demo 占位图</button><button type="button" className={imageGenerationMode === "provider" ? "active real" : ""} onClick={() => setImageGenerationMode("provider")}>真实图片模型</button></div></div><label><span>图片模型</span><input value={imageModel} onChange={(event) => setImageModel(event.target.value)} disabled={imageGenerationMode !== "provider"} /></label><aside><small>提示词来源</small><strong>final_video_plan.shots[当前镜].reference_image_plan</strong><p>{imageGenerationMode === "provider" ? imageGenerationConfig?.configured ? `将调用 OpenRouter Images API · ${imageGenerationConfig.resolution} · ${imageGenerationConfig.quality}，会产生两张图片的费用。` : "后端没有配置 OPENROUTER_API_KEY，真实生成按钮不可用。" : "只验证流程，不调用图片模型；显示的图片不是该分镜真实生成结果。"}</p></aside></div>
-          <label className="shotSelector"><span>选择分镜片段</span><select value={selectedWorkflowShot?.shot_id || ""} onChange={(event) => setSelectedWorkflowShotId(event.target.value)}>{finalShots.map((shot) => <option key={shot.shot_id} value={shot.shot_id}>{shot.shot_id} · {shot.model} · {shot.duration}s</option>)}</select></label>
-          {selectedWorkflowShot && <div className="referenceWorkspace">
-            <div className="promptPair"><section><div><span>开始站位图提示词</span><small>{selectedWorkflowShot.reference_image_plan?.output_asset_ids?.entry}</small></div><pre>{selectedWorkflowShot.reference_image_plan?.entry_state_reference_prompt_zh || "该分镜没有开始图提示词"}</pre></section><section><div><span>结束站位图编辑提示词</span><small>{selectedWorkflowShot.reference_image_plan?.output_asset_ids?.exit}</small></div><pre>{selectedWorkflowShot.reference_image_plan?.exit_state_reference_edit_prompt_zh || "该分镜没有结束图提示词"}</pre></section></div>
-            <div className="referenceInputAssets"><span>自动使用的图片资产</span><div>{(selectedWorkflowShot.reference_image_plan?.input_asset_ids || []).map((assetId) => <i key={assetId} className={assetRegistry[assetId] ? "ready" : ""}>{assetRegistry[assetId] ? "✓" : "!"} {assetId}</i>)}</div></div>
-            {selectedReferenceManifest ? <div className="referenceImages"><figure><div>{selectedReferenceManifest.entry?.image_url && <img src={`${API_BASE}${selectedReferenceManifest.entry.image_url}`} alt={`${selectedWorkflowShot.shot_id} 开始站位图`} />}</div><figcaption><strong>开始站位图</strong><small>{selectedReferenceManifest.entry?.asset_id}</small></figcaption></figure><figure><div>{selectedReferenceManifest.exit?.image_url && <img src={`${API_BASE}${selectedReferenceManifest.exit.image_url}`} alt={`${selectedWorkflowShot.shot_id} 结束站位图`} />}</div><figcaption><strong>结束站位图</strong><small>{selectedReferenceManifest.exit?.asset_id}</small></figcaption></figure><aside><span>生成状态</span><strong>{selectedReferenceManifest.status}</strong><p>{selectedReferenceManifest.message}</p>{selectedReferenceManifest.image_model && <em>{selectedReferenceManifest.image_model}</em>}{selectedReferenceManifest.demo_placeholder && <b>当前为流程占位样图，不是逐镜真实生成</b>}</aside></div> : <div className="referenceEmpty">当前分镜尚未生成站位图。先确认上方所用资产均为 ✓，然后选择“真实图片模型”生成。</div>}
-          </div>}
-          {referenceBulk && <div className="workflowJsonSummary"><div><span>批量结果</span><b>完成 {referenceBulk.completed_count || 0} · 阻塞 {referenceBulk.blocked_count || 0}</b></div><pre>{JSON.stringify(referenceBulk.blocked || [], null, 2)}</pre></div>}
-        </>}
-
-        {workflowStep === "binding" && <>
-          <div className="workflowIntro"><div><small>STEP 08 / AUTO BINDING</small><h3>自动绑定视频提示词、站位图与逻辑资产</h3><p>此步骤不生成内容，只检查每个分镜所需资产，并形成可直接交给视频提供商适配器的 payload。</p></div><button type="button" onClick={() => void runAutoBinding()} disabled={Boolean(workflowBusy)}>{workflowBusy === "binding" ? "正在检查…" : "运行独立绑定检查"}</button></div>
-          {bindingResult ? <><div className="workflowMetrics"><div><small>可提交分镜</small><strong>{bindingResult.ready_count || 0}</strong></div><div><small>阻塞分镜</small><strong>{bindingResult.blocked_count || 0}</strong></div><div><small>登记资产</small><strong>{bindingResult.registry_count || 0}</strong></div><div><small>计划分镜</small><strong>{finalShots.length}</strong></div></div><div className="bindingGrid"><section><h4>阻塞详情</h4><pre>{JSON.stringify(bindingResult.blocked || [], null, 2)}</pre></section><section><h4>首个就绪 Payload</h4><pre>{JSON.stringify(bindingResult.ready?.[0] || {}, null, 2)}</pre></section></div></> : <div className="debugEmpty compact"><strong>尚未运行绑定检查</strong><p>它会明确区分“原始图片资产缺失”和“开始/结束站位图尚未生成”。</p></div>}
-        </>}
-
-        {workflowStep === "submit" && <>
-          <div className="workflowIntro"><div><small>STEP 09 / VIDEO QUEUE</small><h3>送往视频生成流程</h3><p>系统会先自动绑定每个镜头的视频提示词、开始图、结束图和所用资产；只有完整分镜才进入队列。</p></div><button type="button" onClick={() => void submitVideoJobs()} disabled={Boolean(workflowBusy)}>{workflowBusy === "submit" ? "正在提交…" : "提交完整分镜到视频队列"}</button></div>
-          <div className="localWarning"><b>Demo 提交模式</b><span>当前只在本地创建 queued_demo 任务清单，不会调用真实视频模型或扣费。</span></div>
-          {submitResult ? <><div className="workflowMetrics"><div><small>已入队</small><strong>{submitResult.submitted_count || 0}</strong></div><div><small>被阻塞</small><strong>{submitResult.blocked_count || 0}</strong></div><div><small>登记资产</small><strong>{submitResult.registry_count || 0}</strong></div><div><small>执行模式</small><strong className="smallValue">LOCAL</strong></div></div><div className="jobRows">{(submitResult.jobs || []).slice(0, 12).map((job) => <div key={job.job_id}><span>{job.shot_id}</span><strong>{job.status}</strong><small>{job.bound_asset_ids?.length || 0} 个图片绑定 · 含 {job.derived_reference_ids?.length || 0} 张站位图</small><code>{job.job_id}</code></div>)}</div>{(submitResult.jobs?.length || 0) > 12 && <p className="jobMore">另有 {(submitResult.jobs?.length || 0) - 12} 个任务已入队。</p>}<div className="workflowJsonSummary"><div><span>未提交分镜</span><b>{submitResult.blocked_count || 0}</b></div><pre>{JSON.stringify(submitResult.blocked || [], null, 2)}</pre></div></> : <div className="debugEmpty compact"><strong>等待独立提交</strong><p>提交动作会实时重新检查绑定，因此不要求必须先手动点击上一步。</p></div>}
-        </>}
-      </div>}
-    </section>
-
-    <section className="card debugCard">
-      <div className="cardHead debugHead"><div><span>05</span><div><h2>流水线环节调试器</h2><p>任选一个环节独立查看，不需要从 A 阶段重新开始</p></div></div><div className="debugTier">当前档位 <b>{tier.toUpperCase()}</b></div></div>
-      <div className="debugStageBar">{DEBUG_STAGES.map((stage) => <button type="button" key={stage.id} className={debugStage === stage.id ? "active" : ""} onClick={() => void loadDebugStage(stage.id)} disabled={debugLoading}><i>{stage.index}</i><span>{stage.label}</span></button>)}</div>
-      {!debugStage && <div className="debugEmpty"><strong>选择一个环节开始调试</strong><p>每个环节都会显示输入制品、输出摘要、JSON 预览和完整制品下载。</p></div>}
-      {debugLoading && <div className="debugEmpty"><strong>正在读取该环节的本地制品…</strong></div>}
-      {debugError && <div className="message error debugMessage">{debugError}</div>}
-      {debugResult && !debugLoading && <div className="debugBody">
-        <div className="debugIntro"><div><small>{debugResult.stage.toUpperCase()} / {debugResult.tier.toUpperCase()}</small><h3>{debugResult.title}</h3><p>{debugResult.description}</p></div><a href={`${API_BASE}${debugResult.download_url}`} download>下载完整制品 <b>↓</b></a></div>
-        <div className="debugFlow"><div><small>INPUT</small><strong>{debugResult.input_artifact}</strong></div><b>→</b><div><small>OUTPUT</small><strong>{debugResult.output_artifact}</strong><span>{(debugResult.output_size_bytes / 1024).toFixed(1)} KB</span></div></div>
-        <div className="debugMetrics">{Object.entries(debugResult.summary).map(([key, value]) => <div key={key}><small>{key}</small><strong>{String(value ?? "—")}</strong></div>)}</div>
-        <div className="debugJsonHead"><span>JSON 调试预览</span><small>大数组仅展示前 3 项，完整数据请下载制品</small></div>
-        <pre className="debugJson">{JSON.stringify(debugResult.preview, null, 2)}</pre>
-      </div>}
-    </section>
-  </main>;
+    </main>
+  );
 }

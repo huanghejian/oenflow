@@ -26,7 +26,7 @@ if (-not $backendRunning) {
         -WindowStyle Hidden
 }
 
-$frontendRunning = Test-NetConnection -ComputerName "localhost" -Port 3000 -InformationLevel Quiet -WarningAction SilentlyContinue
+$frontendRunning = Test-NetConnection -ComputerName "127.0.0.1" -Port 9001 -InformationLevel Quiet -WarningAction SilentlyContinue
 if (-not $frontendRunning) {
     Start-Process -FilePath "npm.cmd" `
         -ArgumentList "run", "dev" `
@@ -35,4 +35,4 @@ if (-not $frontendRunning) {
 }
 
 Start-Sleep -Seconds 2
-Start-Process "http://localhost:3000"
+Start-Process "http://127.0.0.1:9001"
