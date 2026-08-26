@@ -1,0 +1,25 @@
+请基于已识别资产，为每个角色、场景和关键道具生成可直接用于生资产图的提示词。
+
+【输入】
+- project_params：项目参数和全局视觉锁。
+- script：整集剧本。
+- assets：第一步识别出的 characters、scenes、items，只能使用这些资产。
+- story_context：第一步识别出的剧情背景。
+
+【任务】
+1. 保留每个资产原有 id、gid、name，不得新增、删除、合并或重命名资产。
+2. 为每个资产补齐 description、asset_prompt、image_prompts。
+3. image_prompts 必须包含 gpt_image_2、seedream_4、flux_kontext 三个键。
+
+【生资产提示词规则】
+- characters：单人定妆参考图，人物独占画面，清晰正面或三分之二身构图，完整展现发型、服装、体态和辨识点。
+- scenes：无人场景空镜参考图，空间层级、主要入口、核心区域和可复用陈设清晰。
+- items：单个关键道具参考图，完整轮廓、材质和关键细节清晰。
+- 所有提示词以“资产参考图”为目标，不能写剧情动作、台词、镜头运动、字幕、水印或未绑定资产。
+- 默认遵循项目参数中的画幅、时代、类型和 global_visual_lock。
+
+【输出约束】
+- 只输出合法 JSON 对象，不输出 Markdown、解释或分析过程。
+- 顶层字段必须且只能为 characters、scenes、items、story_context。
+- 所有数组必须存在，即使为空也返回 []。
+- 除 flux_kontext 外，所有文本使用简体中文。
