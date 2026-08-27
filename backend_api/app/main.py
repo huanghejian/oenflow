@@ -21,6 +21,9 @@ from .contracts import (
     AutoFlowAssetSplitRequest,
     AutoFlowComposeRequest,
     AutoFlowRouteRequest,
+    AutoFlowReferenceDraftFrameGenerateRequest,
+    AutoFlowReferenceFrameGenerateRequest,
+    AutoFlowReferenceFramePublishRequest,
     AutoFlowReferenceRegenerateRequest,
     AutoFlowSplitRequest,
     AutoFlowStoryboardSplitRequest,
@@ -45,6 +48,9 @@ from .autoflow_service import (
     load_latest_asset_split_result,
     load_latest_route_result,
     load_latest_storyboard_result,
+    generate_latest_reference_frame,
+    generate_reference_frame_from_group,
+    publish_latest_reference_frame,
     regenerate_latest_reference_images,
     route_and_generate_references,
     split_script_assets,
@@ -78,11 +84,22 @@ from .logging_utils import (
     set_request_id,
 )
 from .pipeline_service import compile_video_plan
-from .video_generation_service import get_batch, get_job, get_latest_batch, retry_job
-from .video_poll_scheduler import (
-    start_video_poll_scheduler,
-    stop_video_poll_scheduler,
-)
+try:
+    from .video_generation_service import get_batch, get_job, get_latest_batch, retry_job
+except ModuleNotFoundError:
+    def _missing_video_service(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("线上代码缺少 video_generation_service.py")
+
+    get_batch = get_job = get_latest_batch = retry_job = _missing_video_service
+
+try:
+    from .video_poll_scheduler import start_video_poll_scheduler, stop_video_poll_scheduler
+except ModuleNotFoundError:
+    def start_video_poll_scheduler() -> None:
+        return None
+
+    def stop_video_poll_scheduler() -> None:
+        return None
 from .reference_image_service import (
     DEMO_IMAGE_ROOT,
     GENERATED_IMAGE_ROOT,
@@ -471,7 +488,8 @@ def workflow_image_generation_config() -> dict:
                 "model": settings.xingtu_image_model,
                 "size": settings.xingtu_image_size,
                 "aspect_ratio": "9:16",
-                "generation_strategy": "independent_text_to_image_pair",
+                "generation_strategy": "parallel_entry_exit_from_same_assets",
+                "reference_input_field": "image",
             },
             "openrouter": {
                 "configured": bool(settings.openrouter_api_key),
@@ -554,7 +572,8 @@ def workflow_generate_reference_shot(request: ReferenceImageFromShotRequest) -> 
         payload["image_model"] = request.image_model
         payload["aspect_ratio"] = "9:16"
         if request.generation_mode == "xingtu":
-            manifest = create_reference_image_pair_xingtu_job(payload)
+            references = asset_reference_data_urls(input_ids)
+            manifest = create_reference_image_pair_xingtu_job(payload, references)
         elif request.generation_mode in {"provider", "openrouter"}:
             references = asset_reference_data_urls(input_ids)
             manifest = create_reference_image_pair_provider_job(payload, references)
@@ -816,6 +835,58 @@ def autoflow_regenerate_reference_images(request: AutoFlowReferenceRegenerateReq
             request.generation_mode,
             request.image_model,
             request.shot_ids,
+        ),
+    )
+
+
+@app.post("/v1/autoflow/reference-images/generate-frame")
+def autoflow_generate_reference_frame(request: AutoFlowReferenceFrameGenerateRequest) -> dict:
+    payload = request.model_dump()
+    return _run_logged_endpoint(
+        "autoflow.reference_images.generate_frame",
+        payload,
+        lambda: generate_latest_reference_frame(
+            request.shot_id,
+            request.role,
+            request.generation_mode,
+            request.image_model,
+        ),
+    )
+
+
+@app.post("/v1/autoflow/reference-images/generate-draft-frame")
+def autoflow_generate_reference_draft_frame(
+    request: AutoFlowReferenceDraftFrameGenerateRequest,
+) -> dict:
+    payload = request.model_dump()
+    return _run_logged_endpoint(
+        "autoflow.reference_images.generate_draft_frame",
+        payload,
+        lambda: generate_reference_frame_from_group(
+            request.project_params.model_dump(),
+            request.assets,
+            request.story_context,
+            request.shot_group,
+            request.shot_index,
+            request.role,
+            request.generation_mode,
+            request.image_model,
+        ),
+    )
+
+
+@app.post("/v1/autoflow/reference-images/publish-frame")
+def autoflow_publish_reference_frame(request: AutoFlowReferenceFramePublishRequest) -> dict:
+    payload = request.model_dump()
+    return _run_logged_endpoint(
+        "autoflow.reference_images.publish_frame",
+        payload,
+        lambda: publish_latest_reference_frame(
+            request.shot_id,
+            request.role,
+            request.image_url,
+            request.r2_key,
+            request.generated_frame,
         ),
     )
 

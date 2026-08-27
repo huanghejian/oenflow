@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import threading
-
 from app import autoflow_service
 from app import reference_image_service as service
 
@@ -108,22 +106,23 @@ def main() -> None:
     assert "sequential_image_generation" in _FakeClient.posted_payloads[0]
     assert "sequential_image_generation" not in _FakeClient.posted_payloads[1]
 
-    lineart = service._station_lineart_prompt("秦放站在山门中央", "开始")
-    assert "黑白干净线描" in lineart
-    assert "秦放站在山门中央" in lineart
+    finished = service._station_finished_prompt("秦放站在山门中央", "开始")
+    assert "全彩高完成度成片" in finished
+    assert "禁止线稿" in finished
+    assert "秦放站在山门中央" in finished
 
     original_call = service._call_xingtu_image
     original_save = service._save_generated_image
-    barrier = threading.Barrier(2)
     prompts: list[str] = []
+    reference_batches: list[list[str]] = []
 
-    def parallel_call(prompt: str, model: str, aspect_ratio: str, size: str):
+    def fusion_call(prompt: str, model: str, aspect_ratio: str, size: str, input_references=None):
         prompts.append(prompt)
-        barrier.wait(timeout=2)
+        reference_batches.append(list(input_references or []))
         return b"\xff\xd8\xffmock-jpeg", "image/jpeg", {"images": 1}
 
     try:
-        service._call_xingtu_image = parallel_call
+        service._call_xingtu_image = fusion_call
         service._save_generated_image = lambda job_id, role, data, media_type: (
             f"/workflow-generated/{job_id}_{role}.jpg",
             "image/jpeg",
@@ -135,7 +134,8 @@ def main() -> None:
                 "entry_prompt_zh": "开始站位",
                 "exit_prompt_zh": "结束站位",
                 "aspect_ratio": "9:16",
-            }
+            },
+            ["https://assets.example/scene.jpg", "https://assets.example/role.jpg"],
         )
     finally:
         service._call_xingtu_image = original_call
@@ -144,7 +144,11 @@ def main() -> None:
     assert len(prompts) == 2
     assert any("开始站位" in prompt for prompt in prompts)
     assert any("结束站位" in prompt for prompt in prompts)
-    assert manifest["generation_strategy"] == "parallel_synchronous_text_to_lineart_pair"
+    assert manifest["generation_strategy"] == "parallel_entry_exit_from_same_assets"
+    assert reference_batches == [
+        ["https://assets.example/scene.jpg", "https://assets.example/role.jpg"],
+        ["https://assets.example/scene.jpg", "https://assets.example/role.jpg"],
+    ]
     assert manifest["entry"]["status"] == "completed"
     assert manifest["exit"]["status"] == "completed"
 
@@ -153,7 +157,7 @@ def main() -> None:
     original_register = autoflow_service.register_reference_pair
     try:
         autoflow_service.missing_asset_ids = lambda ids: ["C01"]
-        autoflow_service.create_reference_image_pair_xingtu_job = lambda payload: {
+        autoflow_service.create_reference_image_pair_xingtu_job = lambda payload, references: {
             "shot_id": payload["shot_id"],
             "status": "completed",
             "entry": {"status": "completed", "image_url": "/entry.jpg"},
@@ -179,8 +183,8 @@ def main() -> None:
         autoflow_service.missing_asset_ids = original_missing
         autoflow_service.create_reference_image_pair_xingtu_job = original_create_pair
         autoflow_service.register_reference_pair = original_register
-    assert generated["status"] == "completed"
-    assert generated["unused_missing_asset_ids"] == ["C01"]
+    assert generated["status"] == "blocked"
+    assert generated["missing_asset_ids"] == ["C01"]
     print("xingtu image contract: PASS")
 
 

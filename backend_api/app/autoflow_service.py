@@ -5,6 +5,7 @@ import importlib.util
 import json
 import re
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,6 +27,7 @@ from .director_service import (
 from .long_time_http import LongTimeHttpError, post_json
 from .logging_utils import get_logger, log_event, log_payload
 from .reference_image_service import (
+    create_reference_image_frame_xingtu_job,
     create_reference_image_pair_job,
     create_reference_image_pair_provider_job,
     create_reference_image_pair_xingtu_job,
@@ -34,6 +36,7 @@ from .workflow_service import (
     asset_reference_data_urls,
     missing_asset_ids,
     register_reference_pair,
+    registry_snapshot,
 )
 
 
@@ -65,6 +68,7 @@ AUTOFLOW_ANALYSIS_RESULT_PATH = settings.work_root / "autoflow_analysis" / "late
 AUTOFLOW_ROUTE_RESULT_PATH = settings.work_root / "autoflow_routing" / "latest.json"
 _SCRIPT_MODULE_CACHE: dict[str, ModuleType] = {}
 logger = get_logger(__name__)
+_reference_frame_state_lock = threading.Lock()
 
 
 def _object_schema(props: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -3021,6 +3025,139 @@ def _build_routing_analysis(routed_plan: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _reference_input_bindings_for_shot(
+    shot: dict[str, Any], registry_assets: dict[str, Any] | None = None
+) -> tuple[list[str], list[dict[str, Any]]]:
+    image_plan = shot.get("reference_image_plan") or {}
+    input_ids = [str(value) for value in image_plan.get("input_asset_ids", []) if value]
+    reference_meta = {
+        str(ref.get("asset_id")): {
+            "asset_type": ref.get("asset_type"),
+            "purpose": ref.get("purpose"),
+            "required": bool(ref.get("required", True)),
+        }
+        for ref in shot.get("references", []) or []
+        if isinstance(ref, dict) and ref.get("asset_id") and not ref.get("derived")
+    }
+    assets = registry_assets if registry_assets is not None else registry_snapshot().get("assets") or {}
+    bindings = [
+        {
+            "asset_id": asset_id,
+            **reference_meta.get(asset_id, {}),
+            **(
+                {
+                    "binding_status": "bound",
+                    "url": assets[asset_id].get("url"),
+                    "source": assets[asset_id].get("source"),
+                    "original_filename": assets[asset_id].get("original_filename"),
+                }
+                if asset_id in assets
+                else {"binding_status": "missing"}
+            ),
+        }
+        for asset_id in input_ids
+    ]
+    return input_ids, bindings
+
+
+def _scene_contexts_for_reference_images(
+    project_params: dict[str, Any],
+    assets: dict[str, Any],
+    story_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "scene_asset": scene.get("id"),
+            "state": scene.get("description") or scene.get("name"),
+            "lighting": "统一短剧光影",
+            "style_lock": story_context.get("visual_style")
+            or project_params.get("global_visual_lock")
+            or "",
+            "spatial_bible": {},
+        }
+        for scene in _normalize_assets(assets)["scenes"]
+    ]
+
+
+def _prepare_unrouted_reference_shot(
+    project_params: dict[str, Any],
+    assets: dict[str, Any],
+    story_context: dict[str, Any],
+    shot_group: dict[str, Any],
+    shot_index: int,
+) -> dict[str, Any]:
+    """Compile a stable reference-image plan without waiting for video routing.
+
+    Autoflow generation units are marked independent_generation, so the router
+    preserves their order and emits u001, u002, ... without partitioning them.
+    This lets image generation and model routing safely run at the same time.
+    """
+    unit = _to_generation_unit(shot_group, assets)
+    shot_id = f"u{shot_index:03d}"
+    unit["unit_id"] = shot_id
+    logical_references: list[dict[str, Any]] = []
+    asset_refs = unit.get("asset_refs") or {}
+    required_assets = [
+        *(
+            [
+                {
+                    "asset_id": unit.get("scene_asset"),
+                    "asset_type": "scene",
+                    "purpose": "scene_reference",
+                }
+            ]
+            if unit.get("scene_asset")
+            else []
+        ),
+        *[
+            {"asset_id": asset_id, "asset_type": "role", "purpose": "character_reference"}
+            for asset_id in asset_refs.get("roles") or []
+        ],
+        *[
+            {"asset_id": asset_id, "asset_type": "prop", "purpose": "prop_reference"}
+            for asset_id in asset_refs.get("props") or []
+        ],
+    ]
+    for raw in required_assets:
+        if not isinstance(raw, dict) or not raw.get("asset_id"):
+            continue
+        logical_references.append(
+            {
+                "asset_id": str(raw["asset_id"]),
+                "media_type": "image",
+                "asset_type": raw.get("asset_type"),
+                "purpose": raw.get("purpose") or "style_reference",
+                "required": True,
+                "binding_status": "logical_only",
+            }
+        )
+    for frame_role in ("entry", "exit"):
+        logical_references.append(
+            {
+                "asset_id": f"shotref::{shot_id}::{frame_role}",
+                "media_type": "image",
+                "asset_type": "derived_shot_reference",
+                "purpose": "style_reference",
+                "required": True,
+                "derived": True,
+                "derived_role": f"{frame_role}_state_reference",
+                "binding_status": "derived_pending",
+            }
+        )
+    unit["references"] = logical_references
+    prompt_compiler = _load_script_module("prompt_compiler")
+    image_plan = prompt_compiler.compile_reference_image_plan(
+        unit,
+        _scene_contexts_for_reference_images(project_params, assets, story_context),
+    )
+    return {
+        "shot_id": shot_id,
+        "group_id": str(shot_group.get("group_id") or ""),
+        "references": logical_references,
+        "reference_image_plan": image_plan,
+    }
+
+
 def _generate_reference_for_shot(
     episode_id: str,
     shot: dict[str, Any],
@@ -3030,7 +3167,7 @@ def _generate_reference_for_shot(
 ) -> dict[str, Any]:
     image_plan = shot.get("reference_image_plan") or {}
     output_ids = image_plan.get("output_asset_ids") or {}
-    input_ids = [str(value) for value in image_plan.get("input_asset_ids", []) if value]
+    input_ids, input_bindings = _reference_input_bindings_for_shot(shot)
     log_event(
         logger,
         "autoflow.reference.generate_shot.start",
@@ -3040,10 +3177,15 @@ def _generate_reference_for_shot(
         input_asset_ids=input_ids,
     )
     missing = missing_asset_ids(input_ids)
-    # 星图站位线稿为纯文生图，不消费输入资产图；只有
-    # OpenRouter/provider 的图生图编辑模式才必须先完成资产绑定。
-    if missing and generation_mode in {"provider", "openrouter"}:
-        result = {"shot_id": shot.get("shot_id"), "status": "blocked", "missing_asset_ids": missing}
+    if missing and generation_mode in {"provider", "openrouter", "xingtu"}:
+        result = {
+            "shot_id": shot.get("shot_id"),
+            "status": "blocked",
+            "missing_asset_ids": missing,
+            "input_asset_ids": input_ids,
+            "input_asset_bindings": input_bindings,
+            "detail": "请先上传本镜必需的场景、角色或道具图片",
+        }
         log_payload(logger, "autoflow.reference.generate_shot.blocked", result)
         return result
     payload = {
@@ -3057,20 +3199,48 @@ def _generate_reference_for_shot(
         "demo_case": generation_mode == "demo",
         "image_model": image_model,
         "aspect_ratio": aspect_ratio or "9:16",
+        "input_asset_ids": input_ids,
+        "input_asset_bindings": input_bindings,
     }
     if not payload["entry_prompt_zh"] or not payload["exit_prompt_zh"]:
         result = {"shot_id": shot.get("shot_id"), "status": "blocked", "detail": "缺少首帧或尾帧提示词"}
         log_payload(logger, "autoflow.reference.generate_shot.blocked", result)
         return result
-    if generation_mode == "xingtu":
-        manifest = create_reference_image_pair_xingtu_job(payload)
-    elif generation_mode in {"provider", "openrouter"}:
-        manifest = create_reference_image_pair_provider_job(payload, asset_reference_data_urls(input_ids))
-    else:
-        manifest = create_reference_image_pair_job(payload)
+    try:
+        if generation_mode == "manual":
+            manifest = create_reference_image_pair_job(payload)
+            manifest.update(
+                {
+                    "status": "waiting_manual",
+                    "generation_mode": "manual",
+                    "generation_strategy": "manual_or_batch_after_routing",
+                    "message": "路由已完成；请逐张或批量生成全彩融合首尾帧。",
+                }
+            )
+            manifest["entry"]["status"] = "waiting_manual"
+            manifest["exit"]["status"] = "waiting_for_entry"
+        elif generation_mode == "xingtu":
+            manifest = create_reference_image_pair_xingtu_job(
+                payload, asset_reference_data_urls(input_ids)
+            )
+        elif generation_mode in {"provider", "openrouter"}:
+            manifest = create_reference_image_pair_provider_job(
+                payload, asset_reference_data_urls(input_ids)
+            )
+        else:
+            manifest = create_reference_image_pair_job(payload)
+    except Exception as exc:
+        result = {
+            "shot_id": shot.get("shot_id"),
+            "status": "blocked",
+            "detail": str(exc),
+            "input_asset_ids": input_ids,
+            "input_asset_bindings": input_bindings,
+        }
+        log_payload(logger, "autoflow.reference.generate_shot.failed", result)
+        return result
     manifest["input_asset_ids"] = input_ids
-    if missing and generation_mode == "xingtu":
-        manifest["unused_missing_asset_ids"] = missing
+    manifest["input_asset_bindings"] = input_bindings
     manifest["registry"] = register_reference_pair(manifest)
     log_payload(logger, "autoflow.reference.generate_shot.result", manifest)
     return manifest
@@ -3214,11 +3384,262 @@ def route_and_generate_references(
     return result
 
 
+def _replace_latest_reference_manifest(
+    result: dict[str, Any], manifest: dict[str, Any]
+) -> None:
+    generation = result.setdefault("reference_generation", {})
+    shot_id = str(manifest.get("shot_id") or "")
+    completed = [
+        item for item in generation.get("completed") or []
+        if str(item.get("shot_id") or "") != shot_id
+    ]
+    blocked = [
+        item for item in generation.get("blocked") or []
+        if str(item.get("shot_id") or "") != shot_id
+    ]
+    if manifest.get("status") == "blocked":
+        blocked.append(manifest)
+    else:
+        completed.append(manifest)
+    order = {
+        str(shot.get("shot_id") or ""): index
+        for index, shot in enumerate((result.get("final_video_plan") or {}).get("shots") or [])
+    }
+    completed.sort(key=lambda item: order.get(str(item.get("shot_id") or ""), 10**9))
+    blocked.sort(key=lambda item: order.get(str(item.get("shot_id") or ""), 10**9))
+    generation.update(
+        {
+            "completed": completed,
+            "blocked": blocked,
+            "completed_count": len(completed),
+            "blocked_count": len(blocked),
+            "generation_mode": "manual",
+        }
+    )
+
+
+def generate_latest_reference_frame(
+    shot_id: str,
+    role: str,
+    generation_mode: str,
+    image_model: str | None,
+) -> dict[str, Any]:
+    if generation_mode != "xingtu":
+        raise ValueError("当前手动首尾帧仅支持星图融合生图")
+    result = load_latest_route_result()
+    final_video_plan = result.get("final_video_plan") or {}
+    shot = next(
+        (
+            item for item in final_video_plan.get("shots") or []
+            if str(item.get("shot_id") or "") == shot_id
+        ),
+        None,
+    )
+    if not isinstance(shot, dict):
+        raise ValueError(f"没有找到视频镜头：{shot_id}")
+    if role not in {"entry", "exit"}:
+        raise ValueError(f"不支持的图片角色：{role}")
+
+    source_context = result.get("source_context") or {}
+    project_params = source_context.get("project_params") or {}
+    episode_id = str(project_params.get("episode_id") or "EP001")
+    aspect_ratio = str(project_params.get("aspect_ratio") or "9:16")
+    image_plan = shot.get("reference_image_plan") or {}
+    output_ids = image_plan.get("output_asset_ids") or {}
+    input_ids, input_bindings = _reference_input_bindings_for_shot(shot)
+    missing = missing_asset_ids(input_ids)
+    if missing:
+        raise ValueError(f"请先上传本镜使用的角色、场景或道具图片：{', '.join(missing)}")
+
+    reference_ids = list(input_ids)
+
+    payload = {
+        "episode_id": episode_id,
+        "shot_id": shot_id,
+        "entry_prompt_zh": image_plan.get("entry_state_reference_prompt_zh") or "",
+        "exit_prompt_zh": image_plan.get("exit_state_reference_edit_prompt_zh") or "",
+        "entry_asset_id": output_ids.get("entry"),
+        "exit_asset_id": output_ids.get("exit"),
+        "image_model": image_model,
+        "aspect_ratio": aspect_ratio,
+    }
+    frame_result = create_reference_image_frame_xingtu_job(
+        payload, role, asset_reference_data_urls(reference_ids)
+    )
+    frame_result["input_asset_ids"] = input_ids
+    frame_result["input_asset_bindings"] = input_bindings
+
+    with _reference_frame_state_lock:
+        latest = load_latest_route_result()
+        generation = latest.get("reference_generation") or {}
+        existing = next(
+            (
+                item for item in [
+                    *(generation.get("completed") or []),
+                    *(generation.get("blocked") or []),
+                ]
+                if str(item.get("shot_id") or "") == shot_id
+            ),
+            {},
+        )
+        merged = {
+            **existing,
+            **{key: value for key, value in frame_result.items() if key not in {"entry", "exit"}},
+            role: frame_result[role],
+            "input_asset_ids": input_ids,
+            "input_asset_bindings": input_bindings,
+            "status": "waiting_r2_upload",
+            "message": "融合图已在本地生成，等待浏览器上传前端 R2。",
+        }
+        _replace_latest_reference_manifest(latest, merged)
+        _save_step_result(AUTOFLOW_ROUTE_RESULT_PATH, latest, "autoflow.reference.frame.saved")
+    log_payload(logger, "autoflow.reference.frame.generated", merged)
+    return merged
+
+
+def generate_reference_frame_from_group(
+    project_params: dict[str, Any],
+    assets: dict[str, Any],
+    story_context: dict[str, Any],
+    shot_group: dict[str, Any],
+    shot_index: int,
+    role: str,
+    generation_mode: str,
+    image_model: str | None,
+) -> dict[str, Any]:
+    """Generate one frame from pre-route data so routing can run concurrently."""
+    if generation_mode != "xingtu":
+        raise ValueError("并行融合生图仅支持星图图片模型")
+    if role not in {"entry", "exit"}:
+        raise ValueError(f"不支持的图片角色：{role}")
+    shot = _prepare_unrouted_reference_shot(
+        project_params,
+        assets,
+        story_context,
+        shot_group,
+        shot_index,
+    )
+    shot_id = str(shot["shot_id"])
+    image_plan = shot.get("reference_image_plan") or {}
+    output_ids = image_plan.get("output_asset_ids") or {}
+    input_ids, input_bindings = _reference_input_bindings_for_shot(shot)
+    missing = missing_asset_ids(input_ids)
+    if missing:
+        raise ValueError(f"请先上传本镜使用的角色、场景或道具图片：{', '.join(missing)}")
+    payload = {
+        "episode_id": str(project_params.get("episode_id") or "EP001"),
+        "shot_id": shot_id,
+        "entry_prompt_zh": image_plan.get("entry_state_reference_prompt_zh") or "",
+        "exit_prompt_zh": image_plan.get("exit_state_reference_edit_prompt_zh") or "",
+        "entry_asset_id": output_ids.get("entry"),
+        "exit_asset_id": output_ids.get("exit"),
+        "image_model": image_model,
+        "aspect_ratio": str(project_params.get("aspect_ratio") or "9:16"),
+    }
+    manifest = create_reference_image_frame_xingtu_job(
+        payload,
+        role,
+        asset_reference_data_urls(input_ids),
+    )
+    manifest.update(
+        {
+            "input_asset_ids": input_ids,
+            "input_asset_bindings": input_bindings,
+            "generation_mode": "xingtu_parallel_with_routing",
+            "generation_strategy": "route_and_reference_frames_in_parallel",
+            "message": "融合图已生成；路由就绪后由浏览器上传前端 R2。",
+        }
+    )
+    log_payload(logger, "autoflow.reference.draft_frame.generated", manifest)
+    return manifest
+
+
+def publish_latest_reference_frame(
+    shot_id: str,
+    role: str,
+    image_url: str,
+    r2_key: str,
+    generated_frame: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if role not in {"entry", "exit"}:
+        raise ValueError(f"不支持的图片角色：{role}")
+    if not re.match(r"^https?://", image_url, re.IGNORECASE):
+        raise ValueError("R2 图片地址必须是 HTTP(S) URL")
+    with _reference_frame_state_lock:
+        result = load_latest_route_result()
+        generation = result.get("reference_generation") or {}
+        existing = next(
+            (
+                item for item in [
+                    *(generation.get("completed") or []),
+                    *(generation.get("blocked") or []),
+                ]
+                if str(item.get("shot_id") or "") == shot_id
+            ),
+            None,
+        )
+        if not isinstance(existing, dict) or not isinstance(existing.get(role), dict):
+            raise ValueError("没有找到刚生成的本地融合图，请先执行生图")
+        manifest = copy.deepcopy(existing)
+        frame = manifest[role]
+        if not frame.get("local_image_url") and isinstance(generated_frame, dict):
+            local_image_url = str(generated_frame.get("local_image_url") or "")
+            expected_asset_id = str(frame.get("asset_id") or f"shotref::{shot_id}::{role}")
+            generated_asset_id = str(generated_frame.get("asset_id") or "")
+            if not local_image_url.startswith("/generated-reference-images/"):
+                raise ValueError("并行融合图的本地路径无效")
+            if generated_asset_id != expected_asset_id:
+                raise ValueError("并行融合图与路由镜头的资产 ID 不一致")
+            frame.update(
+                {
+                    "status": generated_frame.get("status") or "generated_local",
+                    "asset_id": generated_asset_id,
+                    "prompt_zh": generated_frame.get("prompt_zh") or frame.get("prompt_zh"),
+                    "image_url": local_image_url,
+                    "local_image_url": local_image_url,
+                    "mime_type": generated_frame.get("mime_type") or "image/jpeg",
+                    "storage": {
+                        "status": "pending_frontend_upload",
+                        "provider": "r2",
+                    },
+                }
+            )
+        if not frame.get("local_image_url"):
+            raise ValueError("本地融合图路径缺失，无法登记 R2 上传结果")
+        frame.update(
+            {
+                "status": "completed",
+                "image_url": image_url,
+                "storage": {
+                    "status": "uploaded",
+                    "provider": "cloudflare-r2",
+                    "key": r2_key,
+                    "url": image_url,
+                },
+            }
+        )
+        pair_uploaded = all(
+            ((manifest.get(frame_role) or {}).get("storage") or {}).get("status") == "uploaded"
+            for frame_role in ("entry", "exit")
+        )
+        manifest["status"] = "completed" if pair_uploaded else "waiting_manual"
+        manifest["message"] = (
+            "首尾融合图均已上传前端 R2。"
+            if pair_uploaded
+            else "当前融合图已上传前端 R2；可继续生成另一张。"
+        )
+        manifest["registry"] = register_reference_pair(manifest)
+        _replace_latest_reference_manifest(result, manifest)
+        _save_step_result(AUTOFLOW_ROUTE_RESULT_PATH, result, "autoflow.reference.frame.published")
+    log_payload(logger, "autoflow.reference.frame.published", manifest)
+    return manifest
+
+
 def load_latest_route_result() -> dict[str, Any]:
     try:
         result = _load_step_result(
             AUTOFLOW_ROUTE_RESULT_PATH,
-            missing_message="尚未保存路由与首尾帧结果，请先点击“执行路由 + 生成首尾线稿”。",
+            missing_message="尚未保存路由与首尾帧结果，请先执行路由。",
             invalid_message="保存的路由与首尾帧结果不是有效 JSON。",
         )
     except FileNotFoundError:
@@ -3280,7 +3701,7 @@ def _restore_latest_route_result_from_debug_artifacts() -> dict[str, Any]:
             return result
         except (OSError, json.JSONDecodeError):
             logger.warning("autoflow.routing.restore_skipped path=%s", result_path, exc_info=True)
-    raise FileNotFoundError("尚未保存路由与首尾帧结果，请先点击“执行路由 + 生成首尾线稿”。")
+    raise FileNotFoundError("尚未保存路由与首尾帧结果，请先执行路由。")
 
 
 def regenerate_latest_reference_images(
