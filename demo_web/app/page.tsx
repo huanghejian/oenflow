@@ -15,6 +15,7 @@ import type {
   AssetRecord,
   AutoFlowAssets,
   ComposeResponse,
+  FinalShot,
   FlowStep,
   GenerationMode,
   ProjectParams,
@@ -230,6 +231,7 @@ export default function Home() {
   const [assetPromptFilter, setAssetPromptFilter] = useState<AssetPromptFilter>("all");
   const [assetPromptPreviewAsset, setAssetPromptPreviewAsset] = useState<AssetItem | null>(null);
   const [assetPromptPreviewVariant, setAssetPromptPreviewVariant] = useState("");
+  const [routingDetailShotId, setRoutingDetailShotId] = useState<string | null>(null);
   const [generationMode, setGenerationMode] = useState<GenerationMode>("xingtu");
   const [imageModel, setImageModel] = useState("doubao-seedream-5-0-pro-260628");
   const [busy, setBusy] = useState("");
@@ -240,8 +242,8 @@ export default function Home() {
   const storyContext = splitResult?.story_context || assetPromptResult?.story_context || assetResult?.story_context || {};
   const segments = splitResult?.segments || [];
   const shotGroups = analysisResult?.shot_groups || [];
-  const routingShots = routeResult?.routing_analysis?.shots || [];
-  const finalShots = routeResult?.final_video_plan?.shots || [];
+  const routingShots = useMemo(() => routeResult?.routing_analysis?.shots || [], [routeResult]);
+  const finalShots = useMemo(() => routeResult?.final_video_plan?.shots || [], [routeResult]);
   const assetPromptAssets = assetPromptResult?.assets || assetResult?.assets || EMPTY_ASSETS;
   const assetPromptCards = useMemo(() => {
     const groups: Array<{ key: Exclude<AssetPromptFilter, "all">; label: string; glyph: string; items: AssetItem[] }> = [
@@ -270,6 +272,14 @@ export default function Home() {
     ),
     [referenceMap],
   );
+  const routingDetailRoute = useMemo(() => {
+    if (!routingDetailShotId) return undefined;
+    return routingShots.find((route) => route.shot_id === routingDetailShotId || route.source_group === routingDetailShotId);
+  }, [routingDetailShotId, routingShots]);
+  const routingDetailFinalShot = useMemo(() => {
+    if (!routingDetailShotId) return undefined;
+    return finalShots.find((shot) => shot.shot_id === routingDetailShotId || shot.group_id === routingDetailShotId);
+  }, [finalShots, routingDetailShotId]);
   const completedSteps = useMemo(() => {
     const done = new Set<FlowStep>();
     if (assetResult) done.add("split");
@@ -733,8 +743,8 @@ export default function Home() {
       if (reanalyze) {
         setNotice(`重新分析完成：形成 ${data.shot_groups.length} 个镜头组，请确认结果。`);
       } else {
-        setActiveStep("analysis");
-        setNotice(`分析完成：形成 ${data.shot_groups.length} 个镜头组，请先查看组内子镜头内容，确认后再进入路由。`);
+        setActiveStep("routing");
+        setNotice(`分析完成：形成 ${data.shot_groups.length} 个镜头组，已进入第五步查看镜头组与表演单元。`);
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : reanalyze ? "重新分析镜头组失败" : "镜头组分析失败");
@@ -759,8 +769,8 @@ export default function Home() {
         setSplitResult({ assets: data.assets, story_context: data.story_context, segments: data.segments, llm: data.llm });
       }
       setAnalysisResult(data);
-      setActiveStep("analysis");
-      setNotice(`已加载最近镜头组分析结果：${data.shot_groups.length} 个镜头组，请先检查分组内容。`);
+      setActiveStep("routing");
+      setNotice(`已加载最近镜头组分析结果：${data.shot_groups.length} 个镜头组，已进入第五步。`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "加载最近镜头组分析结果失败");
     } finally {
@@ -854,41 +864,6 @@ export default function Home() {
     }
   }
 
-  async function regenerateReferenceImages() {
-    if (!routeResult?.final_video_plan?.shots?.length) {
-      setError("请先执行或加载模型路由，再单独重新生成首尾帧。");
-      return;
-    }
-    resetMessages();
-    setBusy("references");
-    setSubmitResult(null);
-    setComposeResult(null);
-    try {
-      const response = await fetch(`${API_BASE}/v1/autoflow/reference-images/regenerate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          generation_mode: "xingtu",
-          image_model: "doubao-seedream-5-0-pro-260628",
-          shot_ids: [],
-        }),
-      });
-      const data = await readJson<RouteResponse>(response);
-      if (!response.ok) throw new Error(data.detail || "重新生成首尾帧失败");
-      setRouteResult(data);
-      await refreshAssetRegistry();
-      const imageCount = (data.reference_generation?.completed || []).reduce(
-        (total, manifest) => total + Number(Boolean(manifest.entry?.image_url)) + Number(Boolean(manifest.exit?.image_url)),
-        0,
-      );
-      setNotice(`首尾帧重新生成完成：${imageCount}/${(data.final_video_plan?.shots?.length || 0) * 2} 张，失败 ${data.reference_generation?.blocked_count || 0} 个镜头。路由与评分未重新计算。`);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "重新生成首尾帧失败");
-    } finally {
-      setBusy("");
-    }
-  }
-
   async function saveRoutingAnalysisPrompt() {
     resetMessages();
     setBusy("routing-prompt-save");
@@ -902,23 +877,46 @@ export default function Home() {
     }
   }
 
-  async function runSubmit() {
+  async function runSubmit(targetShot?: FinalShot) {
     if (!routeResult?.final_video_plan) return;
+    const finalVideoPlan = targetShot
+      ? { ...routeResult.final_video_plan, shots: [targetShot] }
+      : routeResult.final_video_plan;
+    const shotLabel = targetShot?.shot_id || targetShot?.group_id || "当前镜头";
     resetMessages();
-    setBusy("submit");
-    setSubmitResult(null);
-    setComposeResult(null);
+    setBusy(targetShot ? `submit:${shotLabel}` : "submit");
+    if (!targetShot) {
+      setSubmitResult(null);
+      setComposeResult(null);
+    }
     try {
       const response = await fetch(`${API_BASE}/v1/autoflow/video/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_params: projectParams, final_video_plan: routeResult.final_video_plan }),
+        body: JSON.stringify({ project_params: projectParams, final_video_plan: finalVideoPlan }),
       });
       const data = await readJson<SubmitResponse>(response);
       if (!response.ok) throw new Error(data.detail || "视频任务提交失败");
-      setSubmitResult(data);
-      setActiveStep("compose");
-      setNotice(`视频任务提交完成：入队 ${data.submitted_count || 0}，阻塞 ${data.blocked_count || 0}。`);
+      if (targetShot) {
+        setSubmitResult((current) => {
+          const incomingJobs = data.jobs || [];
+          const incomingIds = new Set(incomingJobs.map((job) => job.shot_id).filter(Boolean));
+          const existingJobs = (current?.jobs || []).filter((job) => !job.shot_id || !incomingIds.has(job.shot_id));
+          const mergedJobs = [...existingJobs, ...incomingJobs];
+          return {
+            ...current,
+            ...data,
+            jobs: mergedJobs,
+            submitted_count: mergedJobs.length,
+            blocked: [...(current?.blocked || []), ...(data.blocked || [])],
+          };
+        });
+        setNotice(`${shotLabel} 视频任务提交完成：入队 ${data.submitted_count || 0}，阻塞 ${data.blocked_count || 0}。`);
+      } else {
+        setSubmitResult(data);
+        setActiveStep("compose");
+        setNotice(`视频任务提交完成：入队 ${data.submitted_count || 0}，阻塞 ${data.blocked_count || 0}。`);
+      }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "视频任务提交失败");
     } finally {
@@ -1010,16 +1008,14 @@ export default function Home() {
         <div className="progress-strip"><span style={{ width: `${progressPercent}%` }} /></div>
 
         <section className="page-wrap autoFlowContent">
-          {activeStep !== "assetPrompts" && (
-            <div className="page-head autoPageHead">
+          {activeStep !== "assetPrompts" && activeStep !== "assets" && (
+            <div className="assetCenterHero autoStepHero">
               <div>
-                <span>{currentStep.index}</span>
-                <div>
-                  <p>AI-VIDEO COMPATIBLE WORKFLOW</p>
-                  <h2>{currentStep.title}</h2>
-                </div>
+                <span>{currentStep.index} / 07 AUTOFLOW</span>
+                <h2>{currentStep.title}</h2>
+                <p>{currentStep.caption}</p>
               </div>
-              <div className="page-head-actions autoHeroStats">
+              <div className="autoHeroStats">
                 <span><b>{segments.length}</b> 分镜</span>
                 <span><b>{shotGroups.length}</b> 镜头组</span>
                 <span><b>{finalShots.length}</b> 视频镜头</span>
@@ -1027,7 +1023,7 @@ export default function Home() {
             </div>
           )}
 
-          {activeStep !== "assetPrompts" && (error || notice) && <div className={error ? "message error autoMessage" : "message success autoMessage"}>{error || notice}</div>}
+          {activeStep !== "assetPrompts" && activeStep !== "assets" && (error || notice) && <div className={error ? "message error autoMessage" : "message success autoMessage"}>{error || notice}</div>}
 
       {activeStep === "split" && (
         <form className="autoStepGrid splitGrid" onSubmit={runAssetSplit}>
@@ -1281,22 +1277,100 @@ export default function Home() {
       )}
 
       {activeStep === "analysis" && (
-        <section className="autoStepGrid analysisGrid">
-          <section className="card">
-            <div className="cardHead">
-              <div><span>04</span><div><h2>分析镜头组提示词</h2><p>判断连续拍摄与真实切镜边界。</p></div></div>
+        <section className="assetCenterPage">
+          <section className="analysisWorkspace">
+            <div className="analysisTemplateShell">
+              <details className="assetTemplateDrawer analysisTemplateDrawer">
+                <summary>镜头组分析提示词模板</summary>
+                <label className="autoField analysisPrompt">
+                  {renderPromptLabel("shot-group-analysis", "分析提示词")}
+                  <textarea value={analysisPrompt} onChange={(event) => setPromptTemplateContent("shot-group-analysis", event.target.value)} />
+                </label>
+              </details>
+              <div className="analysisActions">
+                <button className="generateButton autoPrimaryButton" type="button" onClick={() => void runAnalysis()} disabled={Boolean(busy) || !splitResult}>
+                  <span>{busy === "analysis" ? "正在分析镜头组..." : "分析镜头组"}</span><b>→</b>
+                </button>
+                <button className="textButton" type="button" onClick={() => void loadLatestAnalysis()} disabled={Boolean(busy) || backendOnline !== true}>
+                  {busy === "analysis-load" ? "正在加载..." : "加载最近镜头组分析"}
+                </button>
+              </div>
             </div>
-            <label className="autoField analysisPrompt">
-              {renderPromptLabel("shot-group-analysis", "分析提示词")}
-              <textarea value={analysisPrompt} onChange={(event) => setPromptTemplateContent("shot-group-analysis", event.target.value)} />
-            </label>
-            <button className="generateButton autoPrimaryButton" type="button" onClick={() => void runAnalysis()} disabled={Boolean(busy) || !splitResult}>
-              <span>{busy === "analysis" ? "正在分析镜头组..." : "分析镜头组"}</span><b>→</b>
-            </button>
-            <button className="textButton" type="button" onClick={() => void loadLatestAnalysis()} disabled={Boolean(busy) || backendOnline !== true}>
-              {busy === "analysis-load" ? "正在加载..." : "加载最近镜头组分析"}
-            </button>
-            {analysisResult && (
+            <section className="card">
+              <div className="cardHead">
+                <div><span>03 结果</span><div><h2>分镜与子镜头</h2><p>这里展示第三步拆出的分镜；展开分镜后可继续查看每个子镜头。</p></div></div>
+              </div>
+              <StoryboardAccordion segments={segments as Segment[]} />
+            </section>
+          </section>
+        </section>
+      )}
+
+      {activeStep === "routing" && (
+        <section className="assetCenterPage">
+          <div className="analysisTemplateShell routingTemplateShell">
+            <details className="assetTemplateDrawer analysisTemplateDrawer">
+              <summary>逐镜头难度分析提示词</summary>
+              <label className="autoField analysisPrompt">
+                {renderPromptLabel("routing-analysis", "提示词内容")}
+                <textarea
+                  value={routingAnalysisPrompt}
+                  onChange={(event) => setPromptTemplateContent("routing-analysis", event.target.value)}
+                />
+              </label>
+              <div className="routingTemplateOptions">
+                <select value={generationMode} onChange={(event) => selectImageGenerationMode(event.target.value as GenerationMode)}>
+                  <option value="demo">Demo 占位图</option>
+                  <option value="xingtu">星图 5.0 Pro（真实）</option>
+                </select>
+                <input value={imageModel} onChange={(event) => setImageModel(event.target.value)} disabled={generationMode === "demo"} />
+                <span className={`imageProviderState ${generationMode !== "demo" && ((generationMode === "xingtu" && xingtuImageAvailable) || (generationMode === "openrouter" && openrouterImageAvailable)) ? "ready" : ""}`}>
+                  {generationMode === "demo"
+                    ? "占位图 · 9:16"
+                    : generationMode === "xingtu"
+                      ? `${xingtuImageAvailable ? "已配置" : "密钥未配置"} · 同步文生图 · 首尾并行 · 2K · 9:16 · ${shotGroups.length * 2} 张线稿`
+                      : `${openrouterImageAvailable ? "已配置" : "密钥未配置"} · 9:16`}
+                </span>
+                <button
+                  type="button"
+                  className="textButton"
+                  onClick={() => void saveRoutingAnalysisPrompt()}
+                  disabled={Boolean(busy) || !routingAnalysisPrompt.trim()}
+                >
+                  {busy === "routing-prompt-save" ? "保存中..." : "保存难度提示词"}
+                </button>
+              </div>
+            </details>
+            <div className="analysisActions">
+              <button
+                type="button"
+                className="generateButton autoPrimaryButton"
+                onClick={() => void runRoutingAndReferences()}
+                disabled={
+                  Boolean(busy)
+                  || !analysisResult
+                  || !routingAnalysisPrompt.trim()
+                  || (generationMode === "xingtu" && !xingtuImageAvailable)
+                  || (generationMode === "openrouter" && !openrouterImageAvailable)
+                }
+              >
+                <span>{busy === "routing" ? "路由与生图中..." : generationMode === "demo" ? "执行路由 + 占位图" : `执行路由 + 生成 ${shotGroups.length * 2} 张线稿`}</span><b>→</b>
+              </button>
+              <button
+                type="button"
+                className="textButton"
+                onClick={() => void loadLatestRoutingAndReferences("submit")}
+                disabled={Boolean(busy) || backendOnline !== true}
+              >
+                {busy === "routing-load" ? "加载中..." : "加载最近路由与首尾帧"}
+              </button>
+            </div>
+          </div>
+          {analysisResult && (
+            <section className="card">
+              <div className="cardHead">
+                <div><span>04 结果</span><div><h2>镜头组与表演单元</h2><p>展示第四步分析形成的连续拍摄镜头组、组内子镜头和表演状态。</p></div></div>
+              </div>
               <section className="reanalysisBox">
                 <div>
                   <strong>重新分析要求</strong>
@@ -1316,147 +1390,20 @@ export default function Home() {
                   {busy === "reanalysis" ? "正在重新分析..." : "按要求重新分析"}<b>↻</b>
                 </button>
               </section>
-            )}
-            <ShotGroupAnalysisPanel groups={shotGroups} />
-            {analysisResult ? (
-              <button className="analysisNextButton" type="button" onClick={() => setActiveStep("routing")}>
-                <span>确认镜头组，进入路由与首尾帧</span><b>→</b>
-              </button>
-            ) : null}
-          </section>
-          <section className="card">
-            <div className="cardHead">
-              <div><span>分镜</span><div><h2>分镜与子镜头</h2><p>展开分镜后可继续展开每个子镜头。</p></div></div>
-            </div>
-            <StoryboardAccordion segments={segments as Segment[]} />
-          </section>
-        </section>
-      )}
-
-      {activeStep === "routing" && (
-        <section className="card autoFullCard">
-          <div className="cardHead">
-            <div><span>05</span><div><h2>难度分析、路由评分与首尾帧</h2><p>先逐镜头分析生成难度，再由确定性路由器选模型并生成站位参考图。</p></div></div>
-            <div className="autoInlineActions">
-              <button
-                type="button"
-                className="quiet-button"
-                onClick={() => void loadLatestRoutingAndReferences("routing")}
-                disabled={Boolean(busy) || backendOnline !== true}
-              >
-                {busy === "routing-load" ? "加载中..." : "加载最近路由与首尾帧"}
-              </button>
-              <button
-                type="button"
-                className="quiet-button"
-                onClick={() => void regenerateReferenceImages()}
-                disabled={Boolean(busy) || !routeResult?.final_video_plan || !xingtuImageAvailable}
-              >
-                {busy === "references" ? "首尾帧生成中..." : "重新生成首尾帧"}
-              </button>
-              <select value={generationMode} onChange={(event) => selectImageGenerationMode(event.target.value as GenerationMode)}>
-                <option value="demo">Demo 占位图</option>
-                <option value="xingtu">星图 5.0 Pro（真实）</option>
-              </select>
-              <input value={imageModel} onChange={(event) => setImageModel(event.target.value)} disabled={generationMode === "demo"} />
-              <span className={`imageProviderState ${generationMode !== "demo" && ((generationMode === "xingtu" && xingtuImageAvailable) || (generationMode === "openrouter" && openrouterImageAvailable)) ? "ready" : ""}`}>
-                {generationMode === "demo"
-                  ? "占位图 · 9:16"
-                  : generationMode === "xingtu"
-                    ? `${xingtuImageAvailable ? "已配置" : "密钥未配置"} · 同步文生图 · 首尾并行 · 2K · 9:16 · ${shotGroups.length * 2} 张线稿`
-                    : `${openrouterImageAvailable ? "已配置" : "密钥未配置"} · 9:16`}
-              </span>
-              <button
-                type="button"
-                className="textButton"
-                onClick={() => void runRoutingAndReferences()}
-                disabled={
-                  Boolean(busy)
-                  || !analysisResult
-                  || !routingAnalysisPrompt.trim()
-                  || (generationMode === "xingtu" && !xingtuImageAvailable)
-                  || (generationMode === "openrouter" && !openrouterImageAvailable)
-                }
-              >
-                {busy === "routing"
-                  ? "路由与生图中..."
-                  : generationMode === "demo"
-                    ? "执行路由 + 占位图"
-                    : `执行路由 + 生成 ${shotGroups.length * 2} 张线稿`}
-              </button>
-            </div>
-          </div>
-          <section className="routingPromptEditor">
-            <label>
-              {renderPromptLabel("routing-analysis", "逐镜头难度分析提示词")}
-              <textarea
-                value={routingAnalysisPrompt}
-                onChange={(event) => setPromptTemplateContent("routing-analysis", event.target.value)}
-              />
-            </label>
-            <footer>
-              <p>提示词只负责评估难度和能力需求，不直接指定模型；模型、preset、积分和准入仍由 Python 路由器计算。</p>
-              <button
-                type="button"
-                className="quiet-button"
-                onClick={() => void saveRoutingAnalysisPrompt()}
-                disabled={Boolean(busy) || !routingAnalysisPrompt.trim()}
-              >
-                {busy === "routing-prompt-save" ? "保存中..." : "保存难度提示词"}
-              </button>
-            </footer>
-          </section>
-          <RoutingResultPanel
-            routingShots={routingShots}
-            finalShots={finalShots}
-            references={referenceMap}
-            pendingGroups={shotGroups}
-            apiBase={API_BASE}
-            isGenerating={busy === "routing" || busy === "references"}
-          />
-          {routeResult?.reference_generation?.blocked?.length ? (
-            <div className="workflowJsonSummary autoBlockedSummary">
-              <div><span>首尾帧阻塞</span><b>{routeResult.reference_generation.blocked_count || 0}</b></div>
-              <pre>{JSON.stringify(routeResult.reference_generation.blocked, null, 2)}</pre>
-            </div>
-          ) : null}
+              <ShotGroupAnalysisPanel groups={shotGroups} />
+            </section>
+          )}
         </section>
       )}
 
       {activeStep === "submit" && (
-        <section className="card autoFullCard">
+        <section className="assetCenterPage">
+          <section className="card autoFullCard">
           <div className="cardHead">
             <div><span>06</span><div><h2>视频生成</h2><p>提交镜头组路由方案、首尾帧图片、资产图片和分镜提示词，等待每个分镜视频输出。</p></div></div>
             <div className="autoInlineActions submitRouteActions">
-              <span className={`imageProviderState ${xingtuImageAvailable ? "ready" : ""}`}>
-                星图文生图 · 同步返回 · 首尾并行
-              </span>
-              <button
-                type="button"
-                className="quiet-button"
-                onClick={() => void loadLatestRoutingAndReferences("submit")}
-                disabled={Boolean(busy) || backendOnline !== true}
-              >
-                {busy === "routing-load" ? "加载中..." : "加载已生成路由与首尾帧"}
-              </button>
-              <button
-                type="button"
-                className="textButton"
-                onClick={() => void regenerateReferenceImages()}
-                disabled={Boolean(busy) || !routeResult?.final_video_plan || !xingtuImageAvailable}
-              >
-                {busy === "references" ? "首尾帧生成中..." : "重新生成首尾帧"}
-              </button>
-              <button
-                type="button"
-                className="quiet-button"
-                onClick={() => void runRoutingAndReferences("xingtu")}
-                disabled={Boolean(busy) || !analysisResult || !xingtuImageAvailable}
-              >
-                {busy === "routing" ? "重新路由与生图中..." : "重新路由 + 并行生首尾线稿"}
-              </button>
               <button type="button" className="textButton" onClick={() => void runSubmit()} disabled={Boolean(busy) || !routeResult?.final_video_plan || generatedReferenceImageCount < finalShots.length * 2}>
-                {busy === "submit" ? "正在提交..." : "提交生成视频"}
+                {busy === "submit" ? "批量生成中..." : "批量生成"}
               </button>
             </div>
           </div>
@@ -1469,14 +1416,46 @@ export default function Home() {
           <div className="submitShotList">
             {finalShots.map((shot) => {
               const manifest = shot.shot_id ? referenceMap[shot.shot_id] : undefined;
+              const shotLabel = shot.shot_id || shot.group_id || "shot";
+              const route = routingShots.find((item) => item.shot_id === shotLabel || item.source_group === shotLabel);
+              const isShotSubmitting = busy === `submit:${shotLabel}`;
+              const hasReferencePair = Boolean(manifest?.entry?.image_url && manifest?.exit?.image_url);
               return (
-                <article key={shot.shot_id}>
-                  <header>
-                    <strong>{shot.shot_id}</strong>
-                    <span>{shot.model} · {shot.model_params?.resolution_preset}</span>
-                    <b>{shot.duration}s</b>
+                <article className="submitVideoCard" key={shotLabel}>
+                  <header className="submitVideoCardHead">
+                    <div>
+                      <span>{shotLabel}</span>
+                      <strong>{route?.routing_decision?.selected_display_name || shot.model || route?.routing_decision?.selected_model || "未选择模型"}</strong>
+                      <small>{route?.routing_decision?.selected_preset || shot.model_params?.resolution_preset || "—"}</small>
+                    </div>
+                    <div className="submitVideoHeaderActions">
+                      <div className="submitVideoActions">
+                        <button
+                          type="button"
+                          className="quiet-button"
+                          onClick={() => setRoutingDetailShotId(shotLabel)}
+                          disabled={!route}
+                        >
+                          分析详情
+                        </button>
+                        <button
+                          type="button"
+                          className="textButton"
+                          onClick={() => void runSubmit(shot)}
+                          disabled={Boolean(busy) || !routeResult?.final_video_plan || !hasReferencePair}
+                        >
+                          {isShotSubmitting ? "生成中..." : "生成"}
+                        </button>
+                      </div>
+                      <b>{shot.duration || route?.duration || 0}s</b>
+                    </div>
                   </header>
-                  <p>{shot.prompt_zh}</p>
+                  <section className="submitVideoDescription">
+                    <div>
+                      <small>描述</small>
+                      <p>{shot.prompt_zh || "暂无视频生成描述"}</p>
+                    </div>
+                  </section>
                   <ReferenceFrameSlots
                     shotId={shot.shot_id}
                     manifest={manifest}
@@ -1495,6 +1474,31 @@ export default function Home() {
             })}
           </div>
           {submitResult && <div className="workflowJsonSummary autoBlockedSummary"><div><span>提交结果</span><b>{submitResult.submitted_count || 0}</b></div><pre>{JSON.stringify(submitResult, null, 2)}</pre></div>}
+          </section>
+          {routingDetailShotId && (
+            <div className="routeDetailModalBackdrop">
+              <button className="routeDetailModalCloseLayer" type="button" aria-label="关闭路由分析详情" onClick={() => setRoutingDetailShotId(null)} />
+              <section className="routeDetailModal" role="dialog" aria-modal="true" aria-label={`${routingDetailShotId} 路由分析详情`}>
+                <header>
+                  <div>
+                    <span>{routingDetailShotId}</span>
+                    <h3>路由分析结果</h3>
+                    <p>查看该镜头的难度评分、模型路由、选择理由和首尾参考帧。</p>
+                  </div>
+                  <button type="button" onClick={() => setRoutingDetailShotId(null)}>关闭</button>
+                </header>
+                <div className="routeDetailModalBody">
+                  <RoutingResultPanel
+                    routingShots={routingDetailRoute ? [routingDetailRoute] : []}
+                    finalShots={routingDetailFinalShot ? [routingDetailFinalShot] : []}
+                    references={referenceMap}
+                    apiBase={API_BASE}
+                    isGenerating={busy === "routing" || busy === "references"}
+                  />
+                </div>
+              </section>
+            </div>
+          )}
         </section>
       )}
 
