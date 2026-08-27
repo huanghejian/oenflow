@@ -106,10 +106,18 @@ def main() -> None:
     assert "sequential_image_generation" in _FakeClient.posted_payloads[0]
     assert "sequential_image_generation" not in _FakeClient.posted_payloads[1]
 
-    finished = service._station_finished_prompt("秦放站在山门中央", "开始")
+    finished = service._station_finished_prompt(
+        "生成本原子镜头的动作开始状态参考图。该图片仅作为视频模型的普通图片参考，不作为首帧控制参数。"
+        "开始时可见状态：首帧普通参考图，9:16短剧画面。场景：山门；人物：秦放；状态：秦放站在山门中央；"
+        "要求构图清晰、身份稳定、可作为后续视频生成的普通图片参考。",
+        "开始",
+    )
     assert "全彩高完成度成片" in finished
     assert "禁止线稿" in finished
     assert "秦放站在山门中央" in finished
+    assert "不作为首帧控制参数" not in finished
+    assert "首帧普通参考图" not in finished
+    assert "开始状态：场景：山门" in finished
 
     original_call = service._call_xingtu_image
     original_save = service._save_generated_image

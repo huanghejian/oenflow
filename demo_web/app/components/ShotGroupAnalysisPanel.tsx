@@ -17,6 +17,14 @@ function dialogueText(dialogue?: Dialogue): string {
   return content ? `${value.speaker ? `${value.speaker}：` : ""}${content}` : "";
 }
 
+function boundaryStateText(value?: string): string {
+  return (value || "")
+    .replace(/^(?:首帧|尾帧)普通参考图，9:16短剧画面。/, "")
+    .replace("；要求构图清晰、身份稳定、可作为后续视频生成的普通图片参考。", "")
+    .replace(/；。$/, "")
+    .trim();
+}
+
 export default function ShotGroupAnalysisPanel({ groups }: ShotGroupAnalysisPanelProps) {
   if (!groups.length) {
     return <div className="autoEmpty">尚未分析镜头组。</div>;
@@ -93,12 +101,12 @@ export default function ShotGroupAnalysisPanel({ groups }: ShotGroupAnalysisPane
           </section>
           <div className="groupPrompts">
             <section>
-              <small>镜头组首帧提示词</small>
-              <pre>{group.entry_prompt_zh}</pre>
+              <small>镜头组开始状态</small>
+              <pre>{boundaryStateText(group.entry_prompt_zh)}</pre>
             </section>
             <section>
-              <small>镜头组尾帧提示词</small>
-              <pre>{group.exit_prompt_zh}</pre>
+              <small>镜头组结束状态</small>
+              <pre>{boundaryStateText(group.exit_prompt_zh)}</pre>
             </section>
           </div>
         </article>

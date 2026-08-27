@@ -167,13 +167,32 @@ def _xingtu_request_payload(
 
 
 def _station_finished_prompt(prompt: str, state_label: str) -> str:
+    cleaned = str(prompt or "").strip()
+    legacy_prefixes = (
+        "生成本原子镜头的动作开始状态参考图。该图片仅作为视频模型的普通图片参考，不作为首帧控制参数。",
+        "以本镜动作开始状态参考图作为编辑底图，生成同一原子镜头的动作结束状态参考图。该图片仅作为视频模型的普通图片参考，不作为尾帧控制参数。",
+    )
+    for prefix in legacy_prefixes:
+        cleaned = cleaned.replace(prefix, "")
+    cleaned = cleaned.replace(
+        "开始时可见状态：首帧普通参考图，9:16短剧画面。",
+        "开始状态：",
+    ).replace(
+        "只把动作与表演推进到以下结束状态：尾帧普通参考图，9:16短剧画面。",
+        "结束状态：",
+    ).replace(
+        "；要求构图清晰、身份稳定、可作为后续视频生成的普通图片参考。",
+        "",
+    )
+    while "。。" in cleaned:
+        cleaned = cleaned.replace("。。", "。")
     return (
-        f"竖屏 9:16 短剧分镜{state_label}完整参考图，全彩高完成度成片，"
+        f"竖屏 9:16 短剧分镜{state_label}帧，全彩高完成度成片，"
         "严格融合并继承输入角色、场景和道具图片的造型、颜色、材质、光影与视觉风格，"
         "人物位置、身体朝向、表情、动作、前中后景层次和镜头构图必须清晰，"
         "环境、材质和关键道具细节完整，画面可直接作为视频生成的首尾帧。"
         "禁止线稿、草图、白底设定稿、低细节占位图，禁止字幕、字卡、水印和额外文字。"
-        f"镜头状态：{prompt}"
+        f"镜头状态：{cleaned}"
     )
 
 

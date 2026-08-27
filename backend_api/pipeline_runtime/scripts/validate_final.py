@@ -148,12 +148,19 @@ def validate(doc: Dict[str, Any], config: Dict[str, Any], allow_debug: bool = Fa
             output_ids = image_plan.get("output_asset_ids")
             if not isinstance(output_ids, dict) or not output_ids.get("entry") or not output_ids.get("exit"):
                 errors.append(f"{p}.reference_image_plan.output_asset_ids 必须包含 entry/exit")
-            for key in ("entry_state_reference_prompt_zh", "exit_state_reference_edit_prompt_zh"):
+            prompt_requirements = {
+                "entry_state_reference_prompt_zh": "开始状态：",
+                "exit_state_reference_edit_prompt_zh": "结束状态：",
+            }
+            legacy_phrases = ("不作为首帧控制参数", "不作为尾帧控制参数", "首帧普通参考图", "尾帧普通参考图")
+            for key, required_state in prompt_requirements.items():
                 value = image_plan.get(key)
                 if not isinstance(value, str) or not value.strip():
                     errors.append(f"{p}.reference_image_plan.{key} 缺失或为空")
-                elif "普通图片参考" not in value:
-                    errors.append(f"{p}.reference_image_plan.{key} 未声明普通图片参考用途")
+                elif required_state not in value:
+                    errors.append(f"{p}.reference_image_plan.{key} 缺少明确的{required_state.rstrip('：')}")
+                elif any(phrase in value for phrase in legacy_phrases):
+                    errors.append(f"{p}.reference_image_plan.{key} 含旧版套娃或矛盾文案")
             source_id = image_plan.get("continuity_source_shot_id")
             if source_id and (source_id not in seen or source_id == sid):
                 errors.append(f"{p}.reference_image_plan.continuity_source_shot_id 必须指向前序镜头")

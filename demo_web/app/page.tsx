@@ -30,6 +30,7 @@ import type {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
 const VIDEO_POLL_MS = 10_000;
+const REFERENCE_IMAGE_CONCURRENCY = 8;
 const ACTIVE_VIDEO_STATUSES = new Set(["pending", "queued", "submitting", "running"]);
 type PromptTemplateName = "asset-split" | "asset-prompts" | "storyboard-split" | "shot-group-analysis" | "routing-analysis";
 type AssetPromptFilter = "all" | "characters" | "scenes" | "items";
@@ -1333,22 +1334,37 @@ export default function Home() {
     resetMessages();
     setBusy("references-batch");
     try {
-      let generatedCount = 0;
-      const failures: string[] = [];
-      for (const shot of finalShots) {
+      const tasks = finalShots.flatMap((shot) => {
         const shotId = shotKey(shot);
-        if (!shotId) continue;
-        const results = await Promise.allSettled([
-          generateAndPublishReferenceFrame(shotId, "entry"),
-          generateAndPublishReferenceFrame(shotId, "exit"),
-        ]);
-        results.forEach((result, index) => {
-          if (result.status === "fulfilled") generatedCount += 1;
-          else failures.push(`${shotId} ${index === 0 ? "开始" : "结束"}图：${result.reason instanceof Error ? result.reason.message : "失败"}`);
-        });
+        if (!shotId) return [];
+        const manifest = referenceMap[shotId];
+        return (["entry", "exit"] as ReferenceFrameRole[])
+          .filter((role) => {
+            const frame = manifest?.[role];
+            return frame?.storage?.status !== "uploaded" || !isHttpUrl(frame.image_url);
+          })
+          .map((role) => ({
+            shotId,
+            role,
+            run: () => generateAndPublishReferenceFrame(shotId, role),
+          }));
+      });
+      const skippedCount = finalShots.length * 2 - tasks.length;
+      if (!tasks.length) {
+        setNotice(`全部 ${skippedCount} 张首尾帧均已上传，无需重复生成。`);
+        return;
       }
+
+      const results = await runWithConcurrency(
+        tasks.map((task) => task.run),
+        REFERENCE_IMAGE_CONCURRENCY,
+      );
+      const failures = results.flatMap((result, index) => result.status === "rejected"
+        ? [`${tasks[index].shotId} ${tasks[index].role === "entry" ? "开始" : "结束"}图：${result.reason instanceof Error ? result.reason.message : "失败"}`]
+        : []);
+      const generatedCount = results.length - failures.length;
       await refreshAssetRegistry();
-      setNotice(`批量融合生图完成：${generatedCount} 张已上传前端 R2，失败 ${failures.length} 张。${failures.length ? ` ${failures.slice(0, 3).join("；")}` : ""}`);
+      setNotice(`8 路并行融合生图完成：${generatedCount} 张已上传前端 R2，跳过已上传 ${skippedCount} 张，失败 ${failures.length} 张。${failures.length ? ` ${failures.slice(0, 3).join("；")}` : ""}`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "批量融合首尾帧生成失败");
     } finally {
@@ -1475,7 +1491,7 @@ export default function Home() {
             selectedImageModel,
           ),
         ));
-        parallelGeneration = runWithConcurrency(frameTasks, 4);
+        parallelGeneration = runWithConcurrency(frameTasks, REFERENCE_IMAGE_CONCURRENCY);
       }
 
       const response = await routeRequest;
@@ -2200,7 +2216,7 @@ export default function Home() {
         <section className="assetCenterPage submitGenerationPage">
           <section className="card autoFullCard submitGenerationToolbar">
           <div className="cardHead">
-            <div><span>06</span><div><h2>视频生成</h2><p>基于首尾帧融合图提交视频生成；可查看逐个分镜，也可手动重生单张或批量补生。</p></div></div>
+            <div><span>06</span><div><h2>视频生成</h2><p>首尾帧以 8 路并行补齐并逐张上传；完成后基于融合图提交视频生成。</p></div></div>
             <div className="autoInlineActions submitRouteActions">
               <button
                 type="button"
@@ -2208,7 +2224,7 @@ export default function Home() {
                 onClick={() => void generateAllReferenceFrames()}
                 disabled={Boolean(busy) || !routeResult?.final_video_plan || !xingtuImageAvailable || !r2UploadAvailable}
               >
-                {busy === "references-batch" ? "逐张融合并上传中..." : "批量生成全部首尾帧"}
+                {busy === "references-batch" ? "8 路并行生成并上传中..." : "并行补齐全部首尾帧"}
               </button>
               <button
                 type="button"

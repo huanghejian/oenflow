@@ -1832,16 +1832,14 @@ def _group_prompt(group: dict[str, Any], state: str) -> str:
     first = sub_shots[0] if sub_shots else {}
     last = sub_shots[-1] if sub_shots else {}
     base = first if state == "entry" else last
-    label = "首帧" if state == "entry" else "尾帧"
-    characters = "、".join(_unique([c for sub in sub_shots for c in sub.get("characters", [])])) or "主体"
-    items = "、".join(_unique([p for sub in sub_shots for p in sub.get("items", [])]))
+    characters = "、".join(_unique(base.get("characters", []))) or "主体"
+    items = "、".join(_unique(base.get("items", [])))
     state_text = base.get("entry_state") if state == "entry" else base.get("exit_state")
     return (
-        f"{label}普通参考图，9:16短剧画面。场景：{base.get('scene') or group.get('scene_asset') or '主场景'}；"
+        f"场景：{base.get('scene') or group.get('scene_asset') or '主场景'}；"
         f"人物：{characters}；"
-        f"{'物品：' + items + '；' if items else ''}"
-        f"状态：{state_text or base.get('performance') or '保持当前剧情动作状态'}；"
-        "要求构图清晰、身份稳定、可作为后续视频生成的普通图片参考。"
+        f"{'道具：' + items + '；' if items else ''}"
+        f"动作状态：{state_text or base.get('performance') or '保持当前剧情动作状态'}"
     )
 
 

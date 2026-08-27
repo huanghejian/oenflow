@@ -443,6 +443,17 @@ def _pre_result_exit_guard(exit_state: str) -> str:
     )
 
 
+def _clean_boundary_state(value: str) -> str:
+    """Accept old wrapped group prompts while compiling a single clean state clause."""
+    text = str(value or "").strip()
+    text = re.sub(r"^(?:首帧|尾帧)普通参考图，9:16短剧画面。", "", text)
+    text = text.replace(
+        "；要求构图清晰、身份稳定、可作为后续视频生成的普通图片参考。",
+        "",
+    )
+    return text.strip("；。 ")
+
+
 def _exit_staging_reserve(exit_state: str) -> str:
     """Reserve composition space in the entry still for the exit-state action."""
     if not exit_state:
@@ -457,7 +468,7 @@ def _exit_staging_reserve(exit_state: str) -> str:
 
 
 def compile_reference_image_plan(unit: Dict[str, Any], contexts: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Compile ordinary shot-reference image prompts; these are not endpoint controls."""
+    """Compile full-color entry and exit frame prompts from the same bound assets."""
     p = common_parts(unit, contexts)
     refs = [x for x in (unit.get("references") or []) if isinstance(x, dict)]
     asset_ids = unique_nonempty(
@@ -471,25 +482,25 @@ def compile_reference_image_plan(unit: Dict[str, Any], contexts: List[Dict[str, 
     camera = _camera_reference_text(unit)
     asset_usage = _reference_asset_usage(refs)
     spatial_hard_guards = _reference_spatial_hard_guards(unit)
-    staging_reserve = _exit_staging_reserve(p["exit"])
+    entry_state = _clean_boundary_state(p["entry"])
+    exit_state = _clean_boundary_state(p["exit"])
+    staging_reserve = _exit_staging_reserve(exit_state)
     stable = "；".join(unique_nonempty([p["scene"], p["spatial"], camera, spatial_hard_guards]))
     entry_prompt = (
-        "生成本原子镜头的动作开始状态参考图。该图片仅作为视频模型的普通图片参考，"
-        "不作为首帧控制参数。"
-        + (f"严格参考逻辑资产：{assets}。" if assets else "")
+        (f"严格参考逻辑资产：{assets}。" if assets else "")
         + (f"参考图职责：{asset_usage}。" if asset_usage else "")
         + (f"固定视觉与构图：{stable}。" if stable else "")
         + (f"结束动作预留区：{staging_reserve}。" if staging_reserve else "")
-        + f"开始时可见状态：{p['entry']}。"
+        + f"开始状态：{entry_state}。"
         + "保持角色身份、服装、道具状态、世界站位、主光方向和9:16构图准确；画面无文字字幕。"
     )
     exit_prompt = (
-        "以本镜动作开始状态参考图作为编辑底图，生成同一原子镜头的动作结束状态参考图。"
-        "该图片仅作为视频模型的普通图片参考，不作为尾帧控制参数。"
-        "严格保持人物身份、服装、场景结构、世界站位关系、主光方向和整体风格；"
-        + (f"继续严格保持以下构图与比例硬约束：{spatial_hard_guards}；" if spatial_hard_guards else "")
-        + f"只把动作与表演推进到以下结束状态：{p['exit']}。"
-        + (f"{_pre_result_exit_guard(p['exit'])}。" if _pre_result_exit_guard(p["exit"]) else "")
+        (f"严格参考逻辑资产：{assets}。" if assets else "")
+        + (f"参考图职责：{asset_usage}。" if asset_usage else "")
+        + (f"固定视觉与构图：{stable}。" if stable else "")
+        + "保持人物身份、服装、场景结构、世界站位关系、主光方向和整体风格；"
+        + f"结束状态：{exit_state}。"
+        + (f"{_pre_result_exit_guard(exit_state)}。" if _pre_result_exit_guard(exit_state) else "")
     )
     if unit.get("cut_out") == "concealed_cut":
         exit_prompt += "结束构图必须形成导演已指定的全屏遮挡、烟雾、闪光或甩镜模糊接缝，便于隐藏剪辑。"
