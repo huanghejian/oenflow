@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import RoutingResultPanel from "./components/RoutingResultPanel";
+import ReferenceFrameSlots from "./components/ReferenceFrameSlots";
 import ShotGroupAnalysisPanel from "./components/ShotGroupAnalysisPanel";
 import StepTabs from "./components/StepTabs";
 import StoryboardAccordion from "./components/StoryboardAccordion";
@@ -26,32 +27,35 @@ import type {
 } from "./components/autoflowTypes";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
-type PromptTemplateName = "asset-split" | "asset-prompts" | "storyboard-split" | "shot-group-analysis";
+type PromptTemplateName = "asset-split" | "asset-prompts" | "storyboard-split" | "shot-group-analysis" | "routing-analysis";
 type AssetPromptFilter = "all" | "characters" | "scenes" | "items";
+type NetworkMode = "direct" | "proxy";
 type PromptVersion = {
   version: string;
   created_at?: string;
   size_bytes?: number;
 };
-const PROMPT_TEMPLATE_NAMES: PromptTemplateName[] = ["asset-split", "asset-prompts", "storyboard-split", "shot-group-analysis"];
+const PROMPT_TEMPLATE_NAMES: PromptTemplateName[] = ["asset-split", "asset-prompts", "storyboard-split", "shot-group-analysis", "routing-analysis"];
 const EMPTY_PROMPT_VERSIONS: Record<PromptTemplateName, PromptVersion[]> = {
   "asset-split": [],
   "asset-prompts": [],
   "storyboard-split": [],
   "shot-group-analysis": [],
+  "routing-analysis": [],
 };
 const EMPTY_SELECTED_PROMPT_VERSIONS: Record<PromptTemplateName, string> = {
   "asset-split": "",
   "asset-prompts": "",
   "storyboard-split": "",
   "shot-group-analysis": "",
+  "routing-analysis": "",
 };
 
 const FLOW_STEPS: Array<{ id: FlowStep; index: string; title: string; caption: string }> = [
   { id: "split", index: "01", title: "识别资产", caption: "剧本 / 资产清单" },
   { id: "assetPrompts", index: "02", title: "资产提示词", caption: "生资产提示词" },
   { id: "assets", index: "03", title: "拆分镜", caption: "资产 / 分镜提示词" },
-  { id: "analysis", index: "04", title: "镜头组分析", caption: "连续拍摄与4秒拼接" },
+  { id: "analysis", index: "04", title: "镜头组分析", caption: "连续镜头与切镜边界" },
   { id: "routing", index: "05", title: "路由与首尾帧", caption: "模型评分并行生图" },
   { id: "submit", index: "06", title: "视频生成", caption: "提交分镜视频任务" },
   { id: "compose", index: "07", title: "视频合成", caption: "ffmpeg 合并分镜视频" },
@@ -60,15 +64,25 @@ const FLOW_STEPS: Array<{ id: FlowStep; index: string; title: string; caption: s
 const EMPTY_ASSETS: AutoFlowAssets = { characters: [], scenes: [], items: [] };
 const DEFAULT_STORYBOARD_PROMPT = `以 Seedance 2.0 分镜导演 Agent 指令系统为基础，只完成分镜结构组织与子镜头规划。
 必须基于上一步资产清单引用角色、场景、关键道具，不要新增未识别的核心资产。
-按 sbid/segment 组织剧情，每个 segment 必须包含 sub_shots，sub_shots 是后续识别连续拍摄、4秒拼接和独立镜头组的基本单位。
+按 sbid/segment 组织剧情，每个 segment 必须包含 sub_shots，sub_shots 是后续识别连续拍摄和真实切镜边界的基本单位。
 每个子镜头保留 duration、content、scene、characters、items、shot_type、camera_movement、entry_state、performance、exit_state、dialogue、continuity_hint、indivisible。
 分镜规划需要遵守：台词不遗漏、角色/道具引用准确、空间状态连续、活态表演、自然语言运镜、光影氛围、景别角度多样性。
 最终只返回 ai-video 自动流兼容 JSON，不输出审视过程、检查清单或 markdown。`;
-const DEFAULT_ANALYSIS_PROMPT = `请分析相邻子镜头之间的拍摄关系：
-1. 哪些子镜头必须连续拍摄、不可分割。
-2. 哪些子镜头因为不足最小4秒，需要向后拼接成镜头组。
-3. 哪些单个子镜头已满足独立拍摄条件。
-同时为每个镜头组输出首帧普通参考图提示词和尾帧编辑提示词。`;
+const DEFAULT_ANALYSIS_PROMPT = `读取 ordered_sub_shots 中每个小镜头的完整内容，只做镜头组划分，不要继续拆解小镜头。
+核心任务是判断相邻小镜头是否属于同一段连续表演：动作、台词、呼吸、视线、情绪、行为意图和身体状态是否自然延续，演员是否无需停下、复位或重新起拍。
+景别或运镜名称发生变化不等于切镜；如果摄影机能够通过连续推拉、摇移、跟拍或变焦完成变化，仍应合并。
+同一动作的准备、发生、结果，以及一句台词前后的连续动作反应，应优先组成同一个连续表演镜头组。
+单个小镜头 duration 大于或等于 4 秒时，可以独立成为 independent 单镜组。
+单个小镜头或镜头组总时长小于 4 秒时禁止独立输出，必须优先与同一段连续表演的前后相邻镜头合并，直到总时长达到或超过 4 秒。
+如果动作、机位、视点、时空和主体状态连续且没有真实切镜点，则按顺序合并为 continuous_take。
+如果不足 4 秒且前后都存在真实切镜点，仍必须与剧情关系更紧密的相邻镜头打包为 min_duration_pack，并保留组内切镜语义，不能伪装成 continuous_take。
+除非整份输入总时长本身不足 4 秒，否则最终不得出现不足 4 秒的镜头组。
+保持原顺序完整覆盖全部小镜头，不得遗漏、重复、跨越或改写剧情。`;
+const DEFAULT_ROUTING_ANALYSIS_PROMPT = `请对每个镜头组内的每一个小镜头 sub_shot 分别进行视频生成难度打分，评估表演、口型、身份一致性、多角色控制、动作、物理交互、运镜、道具、特效和时序连续性。
+每个小镜头都必须输出 0-100 难度总分、十项 0-100 维度分、难度等级、判断原因和关键风险。
+同时评估镜头组的 motion、spatial、asset_density、continuity 四项整体复杂度，输出镜头组 0-100 汇总难度分，且不得低于组内最难小镜头。
+只根据镜头内容判断，不因项目档位刻意改变难度；禁止选择或推荐具体模型和 preset，模型选择由后续确定性路由器完成。
+保持 group_id 和 sub_shot.id 与输入顺序一致，完整覆盖所有小镜头。`;
 const DEFAULT_ASSET_PROMPT_GENERATION_PROMPT = `请基于已识别资产，为每个角色、场景和关键道具生成可直接用于生资产图的提示词。
 要求保留原 id/gid/name，不新增核心资产；每个资产输出 asset_prompt，并分别生成 gpt_image_2、seedream_4、flux_kontext 三套 image_prompts。`;
 const DEMO_SCRIPT = `第1集
@@ -190,12 +204,18 @@ function assetsHaveGeneratedPrompts(result: AssetSplitResponse | null): boolean 
 
 export default function Home() {
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
+  const [networkProxyAvailable, setNetworkProxyAvailable] = useState(false);
+  const [xingtuImageAvailable, setXingtuImageAvailable] = useState(false);
+  const [openrouterImageAvailable, setOpenrouterImageAvailable] = useState(false);
+  const [networkMode, setNetworkMode] = useState<NetworkMode>("direct");
   const [activeStep, setActiveStep] = useState<FlowStep>("split");
   const [projectParams, setProjectParams] = useState<ProjectParams>(() => projectDefaults());
   const [assetPrompt, setAssetPrompt] = useState("");
   const [assetPromptGenerationPrompt, setAssetPromptGenerationPrompt] = useState(DEFAULT_ASSET_PROMPT_GENERATION_PROMPT);
   const [storyboardPrompt, setStoryboardPrompt] = useState(DEFAULT_STORYBOARD_PROMPT);
   const [analysisPrompt, setAnalysisPrompt] = useState(DEFAULT_ANALYSIS_PROMPT);
+  const [routingAnalysisPrompt, setRoutingAnalysisPrompt] = useState(DEFAULT_ROUTING_ANALYSIS_PROMPT);
+  const [reanalysisPrompt, setReanalysisPrompt] = useState("");
   const [promptVersions, setPromptVersions] = useState<Record<PromptTemplateName, PromptVersion[]>>(EMPTY_PROMPT_VERSIONS);
   const [selectedPromptVersions, setSelectedPromptVersions] = useState<Record<PromptTemplateName, string>>(EMPTY_SELECTED_PROMPT_VERSIONS);
   const [script, setScript] = useState(DEMO_SCRIPT);
@@ -210,8 +230,8 @@ export default function Home() {
   const [assetPromptFilter, setAssetPromptFilter] = useState<AssetPromptFilter>("all");
   const [assetPromptPreviewAsset, setAssetPromptPreviewAsset] = useState<AssetItem | null>(null);
   const [assetPromptPreviewVariant, setAssetPromptPreviewVariant] = useState("");
-  const [generationMode, setGenerationMode] = useState<GenerationMode>("demo");
-  const [imageModel, setImageModel] = useState("openai/gpt-image-2");
+  const [generationMode, setGenerationMode] = useState<GenerationMode>("xingtu");
+  const [imageModel, setImageModel] = useState("doubao-seedream-5-0-pro-260628");
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -238,8 +258,18 @@ export default function Home() {
     for (const manifest of routeResult?.reference_generation?.completed || []) {
       if (manifest.shot_id) map[manifest.shot_id] = manifest;
     }
+    for (const manifest of routeResult?.reference_generation?.blocked || []) {
+      if (manifest.shot_id && !map[manifest.shot_id]) map[manifest.shot_id] = manifest;
+    }
     return map;
   }, [routeResult]);
+  const generatedReferenceImageCount = useMemo(
+    () => Object.values(referenceMap).reduce(
+      (total, manifest) => total + Number(Boolean(manifest.entry?.image_url)) + Number(Boolean(manifest.exit?.image_url)),
+      0,
+    ),
+    [referenceMap],
+  );
   const completedSteps = useMemo(() => {
     const done = new Set<FlowStep>();
     if (assetResult) done.add("split");
@@ -260,26 +290,36 @@ export default function Home() {
     async function bootstrap() {
       try {
         const response = await fetch(`${API_BASE}/health`, { cache: "no-store" });
-        const data = await readJson<{ ok?: boolean; reference_image_provider_available?: boolean }>(response);
+        const data = await readJson<{
+          ok?: boolean;
+          network_proxy_available?: boolean;
+          openrouter_image_provider_available?: boolean;
+          xingtu_image_provider_available?: boolean;
+        }>(response);
         if (cancelled) return;
         setBackendOnline(Boolean(response.ok && data.ok));
+        setNetworkProxyAvailable(Boolean(data.network_proxy_available));
+        setXingtuImageAvailable(Boolean(data.xingtu_image_provider_available));
+        setOpenrouterImageAvailable(Boolean(data.openrouter_image_provider_available));
       } catch {
         if (!cancelled) setBackendOnline(false);
       }
     }
     async function loadPromptTemplates() {
       try {
-        const [assetSplit, assetPrompts, storyboardSplit, shotGroupAnalysis] = await Promise.all([
+        const [assetSplit, assetPrompts, storyboardSplit, shotGroupAnalysis, routingAnalysis] = await Promise.all([
           loadPromptTemplate("asset-split", ""),
           loadPromptTemplate("asset-prompts", DEFAULT_ASSET_PROMPT_GENERATION_PROMPT),
           loadPromptTemplate("storyboard-split", DEFAULT_STORYBOARD_PROMPT),
           loadPromptTemplate("shot-group-analysis", DEFAULT_ANALYSIS_PROMPT),
+          loadPromptTemplate("routing-analysis", DEFAULT_ROUTING_ANALYSIS_PROMPT),
         ]);
         if (cancelled) return;
         setAssetPrompt(assetSplit);
         setAssetPromptGenerationPrompt(assetPrompts);
         setStoryboardPrompt(storyboardSplit);
         setAnalysisPrompt(shotGroupAnalysis);
+        setRoutingAnalysisPrompt(routingAnalysis);
       } catch (caught) {
         if (!cancelled) setError(caught instanceof Error ? caught.message : "提示词模板读取失败");
       }
@@ -294,6 +334,22 @@ export default function Home() {
     // 初始化只需执行一次，版本刷新函数内部只使用稳定的 setState。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  function selectNetworkMode(mode: NetworkMode) {
+    resetMessages();
+    if (mode === "proxy" && !networkProxyAvailable) {
+      setError("网络代理尚未配置：请在后端 .env 设置 CLAUDE_HTTP_PROXY_URL 后重启服务。");
+      return;
+    }
+    setNetworkMode(mode);
+    setNotice(mode === "proxy" ? "Claude 请求将通过网络代理发送。" : "Claude 请求将强制直连，不读取系统代理。");
+  }
+
+  function selectImageGenerationMode(mode: GenerationMode) {
+    setGenerationMode(mode);
+    if (mode === "xingtu") setImageModel("doubao-seedream-5-0-pro-260628");
+    if (mode === "openrouter") setImageModel("openai/gpt-image-2");
+  }
 
   async function refreshAssetRegistry() {
     try {
@@ -325,6 +381,7 @@ export default function Home() {
     if (name === "asset-prompts") setAssetPromptGenerationPrompt(content);
     if (name === "storyboard-split") setStoryboardPrompt(content);
     if (name === "shot-group-analysis") setAnalysisPrompt(content);
+    if (name === "routing-analysis") setRoutingAnalysisPrompt(content);
     setSelectedPromptVersions((current) => ({ ...current, [name]: selectedVersion }));
   }
 
@@ -437,6 +494,7 @@ export default function Home() {
           asset_prompt: assetPrompt,
           image_models: ["gpt_image_2", "seedream_4", "flux_kontext"],
           use_ai: true,
+          use_network_proxy: networkMode === "proxy",
         }),
       });
       const data = await readJson<AssetSplitResponse>(response);
@@ -533,6 +591,7 @@ export default function Home() {
           prompt_instruction: assetPromptGenerationPrompt,
           image_models: ["gpt_image_2", "seedream_4", "flux_kontext"],
           use_ai: true,
+          use_network_proxy: networkMode === "proxy",
         }),
       });
       const data = await readJson<AssetPromptResponse>(response);
@@ -573,6 +632,7 @@ export default function Home() {
           story_context: assetPromptResult.story_context,
           storyboard_prompt: storyboardPrompt,
           use_ai: true,
+          use_network_proxy: networkMode === "proxy",
         }),
       });
       const data = await readJson<SplitResponse>(response);
@@ -634,11 +694,19 @@ export default function Home() {
     }
   }
 
-  async function runAnalysis() {
+  async function runAnalysis(reanalyze = false) {
     if (!splitResult) return;
+    if (reanalyze && !analysisResult) {
+      setError("请先生成或加载镜头组结果，再进行重新分析。");
+      return;
+    }
+    if (reanalyze && !reanalysisPrompt.trim()) {
+      setError("请先填写重新分析要求，可指定 s001 或 g001 等编号。");
+      return;
+    }
     resetMessages();
-    setBusy("analysis");
-    setAnalysisResult(null);
+    setBusy(reanalyze ? "reanalysis" : "analysis");
+    if (!reanalyze) setAnalysisResult(null);
     setRouteResult(null);
     setSubmitResult(null);
     setComposeResult(null);
@@ -653,16 +721,23 @@ export default function Home() {
           story_context: storyContext,
           segments,
           analysis_prompt: analysisPrompt,
+          reanalysis_prompt: reanalyze ? reanalysisPrompt.trim() : undefined,
+          previous_analysis: reanalyze ? analysisResult : undefined,
           use_ai: true,
+          use_network_proxy: networkMode === "proxy",
         }),
       });
       const data = await readJson<AnalysisResponse>(response);
       if (!response.ok) throw new Error(data.detail || "镜头组分析失败");
       setAnalysisResult(data);
-      setActiveStep("routing");
-      setNotice(`分析完成：形成 ${data.shot_groups.length} 个镜头组。`);
+      if (reanalyze) {
+        setNotice(`重新分析完成：形成 ${data.shot_groups.length} 个镜头组，请确认结果。`);
+      } else {
+        setActiveStep("analysis");
+        setNotice(`分析完成：形成 ${data.shot_groups.length} 个镜头组，请先查看组内子镜头内容，确认后再进入路由。`);
+      }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "镜头组分析失败");
+      setError(caught instanceof Error ? caught.message : reanalyze ? "重新分析镜头组失败" : "镜头组分析失败");
     } finally {
       setBusy("");
     }
@@ -684,8 +759,8 @@ export default function Home() {
         setSplitResult({ assets: data.assets, story_context: data.story_context, segments: data.segments, llm: data.llm });
       }
       setAnalysisResult(data);
-      setActiveStep("routing");
-      setNotice(`已加载最近镜头组分析结果：${data.shot_groups.length} 个镜头组，可继续路由与首尾帧。`);
+      setActiveStep("analysis");
+      setNotice(`已加载最近镜头组分析结果：${data.shot_groups.length} 个镜头组，请先检查分组内容。`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "加载最近镜头组分析结果失败");
     } finally {
@@ -693,24 +768,31 @@ export default function Home() {
     }
   }
 
-  async function runRoutingAndReferences() {
-    if (!splitResult || !analysisResult) return;
+  async function runRoutingAndReferences(modeOverride?: GenerationMode) {
+    if (!analysisResult) return;
+    const selectedGenerationMode = modeOverride || generationMode;
+    const selectedImageModel = selectedGenerationMode === "xingtu"
+      ? "doubao-seedream-5-0-pro-260628"
+      : imageModel;
     resetMessages();
     setBusy("routing");
-    setRouteResult(null);
     setSubmitResult(null);
     setComposeResult(null);
     try {
+      await saveCurrentPromptTemplate("routing-analysis", routingAnalysisPrompt);
       const response = await fetch(`${API_BASE}/v1/autoflow/route-and-generate-refs`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           project_params: projectParams,
           assets,
-          story_context: splitResult.story_context,
+          story_context: storyContext,
           shot_groups: shotGroups,
-          generation_mode: generationMode,
-          image_model: generationMode === "provider" ? imageModel : undefined,
+          generation_mode: selectedGenerationMode,
+          image_model: selectedGenerationMode !== "demo" ? selectedImageModel : undefined,
+          routing_analysis_prompt: routingAnalysisPrompt,
+          use_ai_difficulty: true,
+          use_network_proxy: networkMode === "proxy",
         }),
       });
       const data = await readJson<RouteResponse>(response);
@@ -718,9 +800,103 @@ export default function Home() {
       setRouteResult(data);
       await refreshAssetRegistry();
       setActiveStep("submit");
-      setNotice(`路由完成：${data.final_video_plan?.shots?.length || 0} 个视频镜头；首尾帧完成 ${data.reference_generation?.completed_count || 0}，阻塞 ${data.reference_generation?.blocked_count || 0}。`);
+      const imageCount = (data.reference_generation?.completed || []).reduce(
+        (total, manifest) => total + Number(Boolean(manifest.entry?.image_url)) + Number(Boolean(manifest.exit?.image_url)),
+        0,
+      );
+      setNotice(`路由完成：${data.final_video_plan?.shots?.length || 0} 个视频镜头；首尾线稿完成 ${imageCount} 张，阻塞 ${data.reference_generation?.blocked_count || 0}。`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "路由或首尾帧生成失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function loadLatestRoutingAndReferences(targetStep: "routing" | "submit" = "routing") {
+    resetMessages();
+    setBusy("routing-load");
+    setSubmitResult(null);
+    setComposeResult(null);
+    try {
+      const response = await fetch(`${API_BASE}/v1/autoflow/route-and-generate-refs/latest`, { cache: "no-store" });
+      const data = await readJson<RouteResponse>(response);
+      if (!response.ok) throw new Error(data.detail || "加载最近路由与首尾帧结果失败");
+
+      const source = data.source_context;
+      if (source?.project_params) setProjectParams(source.project_params);
+      if (source?.assets) {
+        const restoredStoryContext = source.story_context || {};
+        setAssetResult({ assets: source.assets, story_context: restoredStoryContext });
+        setAssetPromptResult({ assets: source.assets, story_context: restoredStoryContext });
+      }
+      if (source?.shot_groups) {
+        setAnalysisResult({
+          assets: source.assets,
+          story_context: source.story_context,
+          shot_groups: source.shot_groups,
+        });
+      }
+      const savedMode = data.reference_generation?.generation_mode;
+      if (savedMode === "demo" || savedMode === "xingtu") setGenerationMode(savedMode);
+
+      setRouteResult(data);
+      await refreshAssetRegistry();
+      setActiveStep(targetStep);
+      const imageCount = (data.reference_generation?.completed || []).reduce(
+        (total, manifest) => total + Number(Boolean(manifest.entry?.image_url)) + Number(Boolean(manifest.exit?.image_url)),
+        0,
+      );
+      setNotice(`已加载最近路由与首尾帧：${data.final_video_plan?.shots?.length || 0} 个视频镜头、${imageCount} 张首尾线稿，阻塞 ${data.reference_generation?.blocked_count || 0}。不会重复调用模型或重新生图。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "加载最近路由与首尾帧结果失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function regenerateReferenceImages() {
+    if (!routeResult?.final_video_plan?.shots?.length) {
+      setError("请先执行或加载模型路由，再单独重新生成首尾帧。");
+      return;
+    }
+    resetMessages();
+    setBusy("references");
+    setSubmitResult(null);
+    setComposeResult(null);
+    try {
+      const response = await fetch(`${API_BASE}/v1/autoflow/reference-images/regenerate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          generation_mode: "xingtu",
+          image_model: "doubao-seedream-5-0-pro-260628",
+          shot_ids: [],
+        }),
+      });
+      const data = await readJson<RouteResponse>(response);
+      if (!response.ok) throw new Error(data.detail || "重新生成首尾帧失败");
+      setRouteResult(data);
+      await refreshAssetRegistry();
+      const imageCount = (data.reference_generation?.completed || []).reduce(
+        (total, manifest) => total + Number(Boolean(manifest.entry?.image_url)) + Number(Boolean(manifest.exit?.image_url)),
+        0,
+      );
+      setNotice(`首尾帧重新生成完成：${imageCount}/${(data.final_video_plan?.shots?.length || 0) * 2} 张，失败 ${data.reference_generation?.blocked_count || 0} 个镜头。路由与评分未重新计算。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "重新生成首尾帧失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function saveRoutingAnalysisPrompt() {
+    resetMessages();
+    setBusy("routing-prompt-save");
+    try {
+      const data = await saveCurrentPromptTemplate("routing-analysis", routingAnalysisPrompt);
+      setNotice(`路由难度提示词已保存${data.version ? `为版本 ${data.version}` : ""}。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "路由难度提示词保存失败");
     } finally {
       setBusy("");
     }
@@ -803,6 +979,28 @@ export default function Home() {
             <h1>{projectParams.episode_id} · {currentStep.title}</h1>
           </div>
           <div className="top-actions">
+            <div className="network-mode-switch" aria-label="Claude 网络连接方式">
+              <span>Claude 网络</span>
+              <div>
+                <button
+                  type="button"
+                  className={networkMode === "direct" ? "active" : ""}
+                  onClick={() => selectNetworkMode("direct")}
+                  disabled={Boolean(busy)}
+                >
+                  直连
+                </button>
+                <button
+                  type="button"
+                  className={networkMode === "proxy" ? "active" : ""}
+                  onClick={() => selectNetworkMode("proxy")}
+                  disabled={Boolean(busy)}
+                  title={networkProxyAvailable ? "通过已配置的网络代理请求 Claude" : "未配置 CLAUDE_HTTP_PROXY_URL"}
+                >
+                  {networkProxyAvailable ? "走代理" : "代理未配置"}
+                </button>
+              </div>
+            </div>
             <span className={backendOnline ? "save-state online-state" : "save-state offline-state"}><i />{backendOnline === null ? "连接中" : backendOnline ? "后端已就绪" : "后端未连接"}</span>
             <button className="quiet-button" type="button" onClick={() => void refreshAssetRegistry()} disabled={Boolean(busy)}>刷新资产</button>
             <button className="avatar" aria-label="用户菜单" type="button">OF</button>
@@ -1086,7 +1284,7 @@ export default function Home() {
         <section className="autoStepGrid analysisGrid">
           <section className="card">
             <div className="cardHead">
-              <div><span>04</span><div><h2>分析镜头组提示词</h2><p>识别连续拍摄、4秒拼接与独立镜头组。</p></div></div>
+              <div><span>04</span><div><h2>分析镜头组提示词</h2><p>判断连续拍摄与真实切镜边界。</p></div></div>
             </div>
             <label className="autoField analysisPrompt">
               {renderPromptLabel("shot-group-analysis", "分析提示词")}
@@ -1098,7 +1296,33 @@ export default function Home() {
             <button className="textButton" type="button" onClick={() => void loadLatestAnalysis()} disabled={Boolean(busy) || backendOnline !== true}>
               {busy === "analysis-load" ? "正在加载..." : "加载最近镜头组分析"}
             </button>
+            {analysisResult && (
+              <section className="reanalysisBox">
+                <div>
+                  <strong>重新分析要求</strong>
+                  <span>可指定分镜 s001、镜头组 g001，或填写全局重组规则</span>
+                </div>
+                <textarea
+                  value={reanalysisPrompt}
+                  onChange={(event) => setReanalysisPrompt(event.target.value)}
+                  placeholder="例如：重新检查 g001 内每个相邻边界；存在反打、机位变化或动作已完成时必须切开，只保留真正的一镜到底段落。"
+                />
+                <button
+                  className="reanalysisButton"
+                  type="button"
+                  onClick={() => void runAnalysis(true)}
+                  disabled={Boolean(busy) || !reanalysisPrompt.trim()}
+                >
+                  {busy === "reanalysis" ? "正在重新分析..." : "按要求重新分析"}<b>↻</b>
+                </button>
+              </section>
+            )}
             <ShotGroupAnalysisPanel groups={shotGroups} />
+            {analysisResult ? (
+              <button className="analysisNextButton" type="button" onClick={() => setActiveStep("routing")}>
+                <span>确认镜头组，进入路由与首尾帧</span><b>→</b>
+              </button>
+            ) : null}
           </section>
           <section className="card">
             <div className="cardHead">
@@ -1112,19 +1336,84 @@ export default function Home() {
       {activeStep === "routing" && (
         <section className="card autoFullCard">
           <div className="cardHead">
-            <div><span>05</span><div><h2>路由评分与首尾帧</h2><p>按第四步镜头组执行模型路由，并并行生成首帧和尾帧图片。</p></div></div>
+            <div><span>05</span><div><h2>难度分析、路由评分与首尾帧</h2><p>先逐镜头分析生成难度，再由确定性路由器选模型并生成站位参考图。</p></div></div>
             <div className="autoInlineActions">
-              <select value={generationMode} onChange={(event) => setGenerationMode(event.target.value as GenerationMode)}>
+              <button
+                type="button"
+                className="quiet-button"
+                onClick={() => void loadLatestRoutingAndReferences("routing")}
+                disabled={Boolean(busy) || backendOnline !== true}
+              >
+                {busy === "routing-load" ? "加载中..." : "加载最近路由与首尾帧"}
+              </button>
+              <button
+                type="button"
+                className="quiet-button"
+                onClick={() => void regenerateReferenceImages()}
+                disabled={Boolean(busy) || !routeResult?.final_video_plan || !xingtuImageAvailable}
+              >
+                {busy === "references" ? "首尾帧生成中..." : "重新生成首尾帧"}
+              </button>
+              <select value={generationMode} onChange={(event) => selectImageGenerationMode(event.target.value as GenerationMode)}>
                 <option value="demo">Demo 占位图</option>
-                <option value="provider">真实图片模型</option>
+                <option value="xingtu">星图 5.0 Pro（真实）</option>
               </select>
-              <input value={imageModel} onChange={(event) => setImageModel(event.target.value)} disabled={generationMode !== "provider"} />
-              <button type="button" className="textButton" onClick={() => void runRoutingAndReferences()} disabled={Boolean(busy) || !analysisResult}>
-                {busy === "routing" ? "路由与生图中..." : "执行路由 + 首尾帧"}
+              <input value={imageModel} onChange={(event) => setImageModel(event.target.value)} disabled={generationMode === "demo"} />
+              <span className={`imageProviderState ${generationMode !== "demo" && ((generationMode === "xingtu" && xingtuImageAvailable) || (generationMode === "openrouter" && openrouterImageAvailable)) ? "ready" : ""}`}>
+                {generationMode === "demo"
+                  ? "占位图 · 9:16"
+                  : generationMode === "xingtu"
+                    ? `${xingtuImageAvailable ? "已配置" : "密钥未配置"} · 同步文生图 · 首尾并行 · 2K · 9:16 · ${shotGroups.length * 2} 张线稿`
+                    : `${openrouterImageAvailable ? "已配置" : "密钥未配置"} · 9:16`}
+              </span>
+              <button
+                type="button"
+                className="textButton"
+                onClick={() => void runRoutingAndReferences()}
+                disabled={
+                  Boolean(busy)
+                  || !analysisResult
+                  || !routingAnalysisPrompt.trim()
+                  || (generationMode === "xingtu" && !xingtuImageAvailable)
+                  || (generationMode === "openrouter" && !openrouterImageAvailable)
+                }
+              >
+                {busy === "routing"
+                  ? "路由与生图中..."
+                  : generationMode === "demo"
+                    ? "执行路由 + 占位图"
+                    : `执行路由 + 生成 ${shotGroups.length * 2} 张线稿`}
               </button>
             </div>
           </div>
-          <RoutingResultPanel routingShots={routingShots} finalShots={finalShots} references={referenceMap} apiBase={API_BASE} />
+          <section className="routingPromptEditor">
+            <label>
+              {renderPromptLabel("routing-analysis", "逐镜头难度分析提示词")}
+              <textarea
+                value={routingAnalysisPrompt}
+                onChange={(event) => setPromptTemplateContent("routing-analysis", event.target.value)}
+              />
+            </label>
+            <footer>
+              <p>提示词只负责评估难度和能力需求，不直接指定模型；模型、preset、积分和准入仍由 Python 路由器计算。</p>
+              <button
+                type="button"
+                className="quiet-button"
+                onClick={() => void saveRoutingAnalysisPrompt()}
+                disabled={Boolean(busy) || !routingAnalysisPrompt.trim()}
+              >
+                {busy === "routing-prompt-save" ? "保存中..." : "保存难度提示词"}
+              </button>
+            </footer>
+          </section>
+          <RoutingResultPanel
+            routingShots={routingShots}
+            finalShots={finalShots}
+            references={referenceMap}
+            pendingGroups={shotGroups}
+            apiBase={API_BASE}
+            isGenerating={busy === "routing" || busy === "references"}
+          />
           {routeResult?.reference_generation?.blocked?.length ? (
             <div className="workflowJsonSummary autoBlockedSummary">
               <div><span>首尾帧阻塞</span><b>{routeResult.reference_generation.blocked_count || 0}</b></div>
@@ -1138,13 +1427,42 @@ export default function Home() {
         <section className="card autoFullCard">
           <div className="cardHead">
             <div><span>06</span><div><h2>视频生成</h2><p>提交镜头组路由方案、首尾帧图片、资产图片和分镜提示词，等待每个分镜视频输出。</p></div></div>
-            <button type="button" className="textButton" onClick={() => void runSubmit()} disabled={Boolean(busy) || !routeResult?.final_video_plan}>
-              {busy === "submit" ? "正在提交..." : "提交生成视频"}
-            </button>
+            <div className="autoInlineActions submitRouteActions">
+              <span className={`imageProviderState ${xingtuImageAvailable ? "ready" : ""}`}>
+                星图文生图 · 同步返回 · 首尾并行
+              </span>
+              <button
+                type="button"
+                className="quiet-button"
+                onClick={() => void loadLatestRoutingAndReferences("submit")}
+                disabled={Boolean(busy) || backendOnline !== true}
+              >
+                {busy === "routing-load" ? "加载中..." : "加载已生成路由与首尾帧"}
+              </button>
+              <button
+                type="button"
+                className="textButton"
+                onClick={() => void regenerateReferenceImages()}
+                disabled={Boolean(busy) || !routeResult?.final_video_plan || !xingtuImageAvailable}
+              >
+                {busy === "references" ? "首尾帧生成中..." : "重新生成首尾帧"}
+              </button>
+              <button
+                type="button"
+                className="quiet-button"
+                onClick={() => void runRoutingAndReferences("xingtu")}
+                disabled={Boolean(busy) || !analysisResult || !xingtuImageAvailable}
+              >
+                {busy === "routing" ? "重新路由与生图中..." : "重新路由 + 并行生首尾线稿"}
+              </button>
+              <button type="button" className="textButton" onClick={() => void runSubmit()} disabled={Boolean(busy) || !routeResult?.final_video_plan || generatedReferenceImageCount < finalShots.length * 2}>
+                {busy === "submit" ? "正在提交..." : "提交生成视频"}
+              </button>
+            </div>
           </div>
           <div className="submitSummary">
             <div><small>视频镜头</small><strong>{finalShots.length}</strong></div>
-            <div><small>首尾帧完成</small><strong>{routeResult?.reference_generation?.completed_count || 0}</strong></div>
+            <div><small>首尾线稿</small><strong>{generatedReferenceImageCount}/{finalShots.length * 2}</strong></div>
             <div><small>视频入队</small><strong>{submitResult?.submitted_count || 0}</strong></div>
             <div><small>阻塞</small><strong>{submitResult?.blocked_count || routeResult?.reference_generation?.blocked_count || 0}</strong></div>
           </div>
@@ -1159,10 +1477,18 @@ export default function Home() {
                     <b>{shot.duration}s</b>
                   </header>
                   <p>{shot.prompt_zh}</p>
+                  <ReferenceFrameSlots
+                    shotId={shot.shot_id}
+                    manifest={manifest}
+                    plan={shot.reference_image_plan}
+                    apiBase={API_BASE}
+                    isGenerating={busy === "routing" || busy === "references"}
+                    compact
+                  />
                   <footer>
                     <span>资产 {shot.references?.length || 0}</span>
-                    <span>首帧 {manifest?.entry?.asset_id || "未生成"}</span>
-                    <span>尾帧 {manifest?.exit?.asset_id || "未生成"}</span>
+                    <span>首帧 {manifest?.entry?.asset_id || (manifest?.status === "blocked" ? "失败" : "未生成")}</span>
+                    <span>尾帧 {manifest?.exit?.asset_id || (manifest?.status === "blocked" ? "失败" : "未生成")}</span>
                   </footer>
                 </article>
               );

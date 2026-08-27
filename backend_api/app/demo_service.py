@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from .pipeline_service import _build_routing_analysis
+from .autoflow_service import _build_routing_analysis
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]

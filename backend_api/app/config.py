@@ -24,7 +24,12 @@ class Settings:
     openrouter_image_model: str
     openrouter_image_resolution: str
     openrouter_image_quality: str
+    xingtu_image_api_key: str | None
+    xingtu_image_endpoint: str
+    xingtu_image_model: str
+    xingtu_image_size: str
     claude_converse_url: str | None
+    claude_http_proxy_url: str | None
     claude_region: str | None
     claude_converse_api_key: str | None
     claude_director_model: str | None
@@ -75,7 +80,19 @@ def load_settings() -> Settings:
         openrouter_image_quality=os.environ.get(
             "OPENROUTER_IMAGE_QUALITY", "medium"
         ).strip().lower(),
+        xingtu_image_api_key=(os.environ.get("XINGTU_IMAGE_API_KEY", "").strip() or None),
+        xingtu_image_endpoint=os.environ.get(
+            "XINGTU_IMAGE_ENDPOINT",
+            "https://ark.cn-beijing.volces.com/api/v3/images/generations",
+        ).strip(),
+        xingtu_image_model=os.environ.get(
+            "XINGTU_IMAGE_MODEL", "doubao-seedream-5-0-pro-260628"
+        ).strip(),
+        xingtu_image_size=os.environ.get("XINGTU_IMAGE_SIZE", "2K").strip().upper(),
         claude_converse_url=os.environ.get("CLAUDE_CONVERSE_URL"),
+        claude_http_proxy_url=(
+            os.environ.get("CLAUDE_HTTP_PROXY_URL", "").strip() or None
+        ),
         claude_region=os.environ.get("CLAUDE_REGION"),
         claude_converse_api_key=os.environ.get("CLAUDE_CONVERSE_API_KEY"),
         claude_director_model=os.environ.get("CLAUDE_DIRECTOR_MODEL"),

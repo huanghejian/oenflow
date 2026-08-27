@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.pipeline_service import _build_routing_analysis
+from app.autoflow_service import _build_routing_analysis
 
 
 def main() -> None:
@@ -36,11 +36,22 @@ def main() -> None:
         ],
     }
     analysis = _build_routing_analysis(routed)
-    candidates = analysis["shots"][0]["routing_decision"]["candidates"]
+    decision = analysis["shots"][0]["routing_decision"]
+    candidates = decision["candidates"]
     assert candidates[0]["selected"] is True
     assert candidates[1]["selected"] is False
     assert "selected_references" not in candidates[0]
     assert candidates[1]["hard_reasons"] == ["preset_output_resolution_mismatch"]
+    comparison = decision["model_comparison"]
+    assert [row["model"] for row in comparison] == [
+        "seedance-2.0",
+        "seedance-2.5",
+        "higgsfield-h3",
+        "wan-3.0",
+    ]
+    assert comparison[0]["selected"] is True
+    assert comparison[2]["display_name"] == "MiniMax H3"
+    assert decision["selection_reason"]
     print("routing analysis: PASS")
 
 

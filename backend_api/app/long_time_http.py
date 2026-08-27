@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Any
 
@@ -26,29 +27,53 @@ class LongTimeHttpError(RuntimeError):
         super().__init__(f"HTTP {status_code}; {body or 'empty response'}")
 
 
-_transport = httpx.HTTPTransport(retries=1)
-_client = httpx.Client(
-    transport=_transport,
-    timeout=httpx.Timeout(
-        connect=CONNECT_TIMEOUT_SECONDS,
-        read=READ_TIMEOUT_SECONDS,
-        write=WRITE_TIMEOUT_SECONDS,
-        pool=POOL_TIMEOUT_SECONDS,
-    ),
-    limits=httpx.Limits(
-        max_connections=MAX_CONNECTIONS,
-        max_keepalive_connections=MAX_CONNECTIONS,
-        keepalive_expiry=KEEPALIVE_MINUTES * 60.0,
-    ),
-)
+def _build_client(
+    proxy_url: str | None = None, *, trust_env: bool = False
+) -> httpx.Client:
+    return httpx.Client(
+        transport=httpx.HTTPTransport(retries=1, proxy=proxy_url),
+        timeout=httpx.Timeout(
+            connect=CONNECT_TIMEOUT_SECONDS,
+            read=READ_TIMEOUT_SECONDS,
+            write=WRITE_TIMEOUT_SECONDS,
+            pool=POOL_TIMEOUT_SECONDS,
+        ),
+        limits=httpx.Limits(
+            max_connections=MAX_CONNECTIONS,
+            max_keepalive_connections=MAX_CONNECTIONS,
+            keepalive_expiry=KEEPALIVE_MINUTES * 60.0,
+        ),
+        # Proxy behavior is request-controlled. Direct mode must not inherit
+        # HTTP_PROXY/HTTPS_PROXY from the process environment.
+        trust_env=trust_env,
+    )
+
+
+_client = _build_client(trust_env=True)
+_direct_client = _build_client()
+_proxy_clients: dict[str, httpx.Client] = {}
+_proxy_clients_lock = threading.Lock()
+
+
+def _proxy_client(proxy_url: str) -> httpx.Client:
+    with _proxy_clients_lock:
+        client = _proxy_clients.get(proxy_url)
+        if client is None:
+            client = _build_client(proxy_url)
+            _proxy_clients[proxy_url] = client
+        return client
 
 
 def _post_with_connection_retry(
-    url: str, content: bytes, headers: dict[str, str]
+    url: str,
+    content: bytes,
+    headers: dict[str, str],
+    client: Any | None = None,
 ) -> httpx.Response:
+    request_client = client or _client
     for attempt in range(2):
         try:
-            return _client.post(url, content=content, headers=headers)
+            return request_client.post(url, content=content, headers=headers)
         except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
             message = str(exc).lower()
             disconnected_before_response = (
@@ -68,16 +93,24 @@ def post_json(
     payload: dict[str, Any],
     token: str,
     headers: dict[str, str] | None = None,
+    proxy_url: str | None = None,
+    force_direct: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
     request_headers = dict(headers or {})
     request_headers.setdefault("Authorization", token)
     request_headers.setdefault("Content-Type", "application/json")
     request_headers.setdefault("Accept", "application/json")
     started_at = time.perf_counter()
+    network_mode = "proxy" if proxy_url else "direct" if force_direct else "default"
     log_payload(
         logger,
         "http.post_json.request",
-        {"url": url, "headers": request_headers, "payload": payload},
+        {
+            "url": url,
+            "network_mode": network_mode,
+            "headers": request_headers,
+            "payload": payload,
+        },
     )
 
     try:
@@ -85,6 +118,11 @@ def post_json(
             url,
             json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             request_headers,
+            _proxy_client(proxy_url)
+            if proxy_url
+            else _direct_client
+            if force_direct
+            else _client,
         )
     except httpx.TimeoutException as exc:
         logger.exception("http.post_json.timeout url=%s", url)
@@ -121,6 +159,7 @@ def post_json(
         "http.post_json.response",
         {
             "url": url,
+            "network_mode": network_mode,
             "status_code": response.status_code,
             "elapsed_ms": elapsed_ms,
             "response_id": response.headers.get("x-request-id"),

@@ -20,6 +20,7 @@ from .contracts import (
     AutoFlowAssetSplitRequest,
     AutoFlowComposeRequest,
     AutoFlowRouteRequest,
+    AutoFlowReferenceRegenerateRequest,
     AutoFlowSplitRequest,
     AutoFlowStoryboardSplitRequest,
     AutoFlowSubmitRequest,
@@ -39,7 +40,9 @@ from .autoflow_service import (
     load_latest_analysis_result,
     load_latest_asset_prompt_result,
     load_latest_asset_split_result,
+    load_latest_route_result,
     load_latest_storyboard_result,
+    regenerate_latest_reference_images,
     route_and_generate_references,
     split_script_assets,
     split_script_assets_and_segments,
@@ -76,6 +79,7 @@ from .reference_image_service import (
     GENERATED_IMAGE_ROOT,
     create_reference_image_pair_job,
     create_reference_image_pair_provider_job,
+    create_reference_image_pair_xingtu_job,
     demo_reference_images_available,
 )
 from .workflow_service import (
@@ -103,6 +107,7 @@ PROMPT_TEMPLATE_FILES = {
     "asset-prompts": "asset-prompts.txt",
     "storyboard-split": "storyboard-split.txt",
     "shot-group-analysis": "shot-group-analysis.txt",
+    "routing-analysis": "routing-analysis.txt",
 }
 PROMPT_TEMPLATE_VERSION_ROOT = PROMPT_TEMPLATE_ROOT / "versions"
 PROMPT_VERSION_RE = re.compile(r"^2\.0\.(\d+)$")
@@ -311,8 +316,13 @@ def health() -> dict[str, bool]:
         "ok": True,
         "demo_available": demo_case_available(),
         "generation_available": director_is_configured(),
+        "network_proxy_available": bool(settings.claude_http_proxy_url),
         "reference_image_demo_available": demo_reference_images_available(),
-        "reference_image_provider_available": bool(settings.openrouter_api_key),
+        "reference_image_provider_available": bool(
+            settings.openrouter_api_key or settings.xingtu_image_api_key
+        ),
+        "openrouter_image_provider_available": bool(settings.openrouter_api_key),
+        "xingtu_image_provider_available": bool(settings.xingtu_image_api_key),
     }
 
 
@@ -429,12 +439,26 @@ def workflow_assets() -> dict:
 @app.get("/v1/workflow/image-generation")
 def workflow_image_generation_config() -> dict:
     return {
-        "provider": "openrouter",
-        "configured": bool(settings.openrouter_api_key),
-        "model": settings.openrouter_image_model,
-        "resolution": settings.openrouter_image_resolution,
-        "quality": settings.openrouter_image_quality,
-        "aspect_ratio": "9:16",
+        "default_provider": "xingtu",
+        "providers": {
+            "xingtu": {
+                "configured": bool(settings.xingtu_image_api_key),
+                "provider": "volcengine_ark",
+                "model": settings.xingtu_image_model,
+                "size": settings.xingtu_image_size,
+                "aspect_ratio": "9:16",
+                "generation_strategy": "independent_text_to_image_pair",
+            },
+            "openrouter": {
+                "configured": bool(settings.openrouter_api_key),
+                "provider": "openrouter",
+                "model": settings.openrouter_image_model,
+                "resolution": settings.openrouter_image_resolution,
+                "quality": settings.openrouter_image_quality,
+                "aspect_ratio": "9:16",
+                "generation_strategy": "generate_entry_then_edit_exit",
+            },
+        },
         "prompt_source": "final_video_plan.shots[].reference_image_plan",
     }
 
@@ -471,16 +495,20 @@ def workflow_generate_reference_shot(request: ReferenceImageFromShotRequest) -> 
             request.episode_id, request.shot, request.demo_case
         )
         missing = missing_asset_ids(input_ids)
-        if missing:
+        if missing and request.generation_mode in {"provider", "openrouter"}:
             raise ValueError(f"请先上传或登记该分镜使用的图片资产：{', '.join(missing)}")
         payload["image_model"] = request.image_model
         payload["aspect_ratio"] = "9:16"
-        if request.generation_mode == "provider":
+        if request.generation_mode == "xingtu":
+            manifest = create_reference_image_pair_xingtu_job(payload)
+        elif request.generation_mode in {"provider", "openrouter"}:
             references = asset_reference_data_urls(input_ids)
             manifest = create_reference_image_pair_provider_job(payload, references)
         else:
             manifest = create_reference_image_pair_job(payload)
         manifest["input_asset_ids"] = input_ids
+        if missing and request.generation_mode == "xingtu":
+            manifest["unused_missing_asset_ids"] = missing
         manifest["prompt_source"] = (
             f"final_video_plan.shots[{payload['shot_id']}].reference_image_plan"
         )
@@ -546,6 +574,7 @@ def autoflow_split(request: AutoFlowSplitRequest) -> dict:
             request.story_context,
             request.image_models,
             request.use_ai,
+            request.use_network_proxy,
         ),
     )
 
@@ -565,6 +594,7 @@ def autoflow_split_assets(request: AutoFlowAssetSplitRequest) -> dict:
             request.existing_assets,
             request.image_models,
             request.use_ai,
+            request.use_network_proxy,
         ),
     )
 
@@ -584,6 +614,7 @@ def autoflow_generate_asset_prompts(request: AutoFlowAssetPromptRequest) -> dict
             request.prompt_instruction,
             request.image_models,
             request.use_ai,
+            request.use_network_proxy,
         ),
     )
 
@@ -631,6 +662,7 @@ def autoflow_split_storyboard(request: AutoFlowStoryboardSplitRequest) -> dict:
             request.story_context,
             request.storyboard_prompt,
             request.use_ai,
+            request.use_network_proxy,
         ),
     )
 
@@ -662,7 +694,10 @@ def autoflow_analyze_shot_groups(request: AutoFlowAnalysisRequest) -> dict:
             request.story_context,
             request.segments,
             request.analysis_prompt,
+            request.reanalysis_prompt,
+            request.previous_analysis,
             request.use_ai,
+            request.use_network_proxy,
         ),
     )
 
@@ -695,6 +730,38 @@ def autoflow_route_and_generate_refs(request: AutoFlowRouteRequest) -> dict:
             request.shot_groups,
             request.generation_mode,
             request.image_model,
+            request.routing_analysis_prompt,
+            request.use_ai_difficulty,
+            request.use_network_proxy,
+        ),
+    )
+
+
+@app.get("/v1/autoflow/route-and-generate-refs/latest")
+def autoflow_load_latest_route_and_refs() -> dict:
+    log_event(logger, "autoflow.route_and_generate_refs.latest.request")
+    try:
+        result = load_latest_route_result()
+        log_payload(logger, "autoflow.route_and_generate_refs.latest.response", result)
+        return result
+    except FileNotFoundError as exc:
+        logger.exception("autoflow.route_and_generate_refs.latest not found")
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("autoflow.route_and_generate_refs.latest failed")
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/v1/autoflow/reference-images/regenerate")
+def autoflow_regenerate_reference_images(request: AutoFlowReferenceRegenerateRequest) -> dict:
+    payload = request.model_dump()
+    return _run_logged_endpoint(
+        "autoflow.reference_images.regenerate",
+        payload,
+        lambda: regenerate_latest_reference_images(
+            request.generation_mode,
+            request.image_model,
+            request.shot_ids,
         ),
     )
 

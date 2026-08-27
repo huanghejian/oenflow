@@ -1,6 +1,6 @@
 export type FlowStep = "split" | "assetPrompts" | "assets" | "analysis" | "routing" | "submit" | "compose";
 export type RoutingTier = "low" | "medium" | "high";
-export type GenerationMode = "demo" | "provider";
+export type GenerationMode = "demo" | "openrouter" | "xingtu";
 
 export type ProjectParams = {
   episode_id: string;
@@ -48,6 +48,7 @@ export type Dialogue = {
 
 export type SubShot = {
   id: string;
+  segment_id?: string;
   duration: number;
   content?: string;
   scene?: string;
@@ -60,6 +61,8 @@ export type SubShot = {
   exit_state?: string;
   dialogue?: Dialogue;
   indivisible?: boolean;
+  transition_from_previous?: string;
+  continuity_hint?: string;
 };
 
 export type Segment = {
@@ -106,7 +109,7 @@ export type AssetPromptResponse = AssetSplitResponse;
 
 export type ShotGroup = {
   group_id: string;
-  group_type: "continuous_take" | "min_duration_pack" | "independent" | string;
+  group_type: "continuous_take" | "independent" | string;
   source_segment_ids: string[];
   sub_shot_ids: string[];
   duration: number;
@@ -140,6 +143,21 @@ export type RoutingCandidate = {
   hard_reasons?: string[];
 };
 
+export type RoutingModelComparison = {
+  model?: string;
+  display_name?: string;
+  preset?: string;
+  qualified?: boolean;
+  selected?: boolean;
+  verdict?: "selected" | "qualified" | "rejected" | "unavailable" | string;
+  fit_quality?: number;
+  reliability?: number;
+  call_points?: number;
+  expected_usable_points?: number;
+  hard_reasons?: string[];
+  why?: string;
+};
+
 export type RoutingDecision = {
   tier?: RoutingTier;
   selected_model?: string;
@@ -154,13 +172,35 @@ export type RoutingDecision = {
   medium_target_met?: boolean;
   medium_selection_mode?: string;
   candidates?: RoutingCandidate[];
+  selection_reason?: string;
+  model_comparison?: RoutingModelComparison[];
+};
+
+export type SubShotDifficultyScore = {
+  sub_shot_id?: string;
+  difficulty_score?: number;
+  overall_difficulty?: string;
+  dimension_scores?: Record<string, number>;
+  reason?: string;
+  risks?: string[];
 };
 
 export type RoutingShot = {
   shot_id?: string;
   source_group?: string;
   atomic_ids?: string[];
+  source_sub_shot_ids?: string[];
   duration?: number;
+  routing_requirements?: Record<string, string>;
+  complexity?: Record<string, string>;
+  difficulty_analysis?: {
+    story_priority?: string;
+    difficulty_score?: number;
+    overall_difficulty?: string;
+    reason?: string;
+    risks?: string[];
+    sub_shot_scores?: SubShotDifficultyScore[];
+  };
   routing_decision?: RoutingDecision;
 };
 
@@ -187,7 +227,12 @@ export type ReferenceManifest = {
   status?: string;
   demo_placeholder?: boolean;
   message?: string;
+  detail?: string;
   image_model?: string;
+  provider?: string;
+  generation_mode?: string;
+  aspect_ratio?: string;
+  size?: string;
   input_asset_ids?: string[];
   missing_asset_ids?: string[];
   entry?: { asset_id?: string; image_url?: string; prompt_zh?: string; status?: string };
@@ -195,6 +240,11 @@ export type ReferenceManifest = {
 };
 
 export type RouteResponse = {
+  difficulty_analysis?: {
+    summary?: string;
+    shots?: Array<RoutingShot["difficulty_analysis"] & { group_id?: string }>;
+    llm?: Record<string, unknown>;
+  };
   routing_analysis?: { tier?: RoutingTier; target_resolution?: string; shots?: RoutingShot[] };
   final_video_plan?: { shots?: FinalShot[]; reference_image_jobs?: unknown[] };
   reference_generation?: {
@@ -203,6 +253,12 @@ export type RouteResponse = {
     completed?: ReferenceManifest[];
     blocked?: ReferenceManifest[];
     generation_mode?: GenerationMode;
+  };
+  source_context?: {
+    project_params?: ProjectParams;
+    assets?: AutoFlowAssets;
+    story_context?: Record<string, unknown>;
+    shot_groups?: ShotGroup[];
   };
   detail?: string;
 };

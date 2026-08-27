@@ -19,3 +19,6 @@ dist/
 .DS_Store
 Thumbs.db
 *.log
+
+# Local generated media
+生成图片/

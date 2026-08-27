@@ -76,7 +76,7 @@ class ReferenceImageFromShotRequest(BaseModel):
     episode_id: str = Field(min_length=1)
     shot: dict[str, Any]
     demo_case: bool = True
-    generation_mode: Literal["demo", "provider"] = "demo"
+    generation_mode: Literal["demo", "provider", "openrouter", "xingtu"] = "demo"
     image_model: str | None = Field(default=None, min_length=1, max_length=200)
 
 
@@ -111,6 +111,7 @@ class AutoFlowSplitRequest(BaseModel):
     story_context: dict[str, Any] | None = None
     image_models: list[str] = Field(default_factory=list)
     use_ai: bool = True
+    use_network_proxy: bool = False
 
 
 class AutoFlowAssetSplitRequest(BaseModel):
@@ -122,6 +123,7 @@ class AutoFlowAssetSplitRequest(BaseModel):
     existing_assets: str | list[dict[str, Any]] | None = None
     image_models: list[str] = Field(default_factory=list)
     use_ai: bool = True
+    use_network_proxy: bool = False
 
 
 class AutoFlowAssetPromptRequest(BaseModel):
@@ -133,6 +135,7 @@ class AutoFlowAssetPromptRequest(BaseModel):
     prompt_instruction: str = Field(min_length=1, max_length=100_000)
     image_models: list[str] = Field(default_factory=list)
     use_ai: bool = True
+    use_network_proxy: bool = False
 
 
 class AutoFlowStoryboardSplitRequest(BaseModel):
@@ -142,6 +145,7 @@ class AutoFlowStoryboardSplitRequest(BaseModel):
     story_context: dict[str, Any] = Field(default_factory=dict)
     storyboard_prompt: str = Field(min_length=1, max_length=300_000)
     use_ai: bool = True
+    use_network_proxy: bool = False
 
 
 class AutoFlowAnalysisRequest(BaseModel):
@@ -150,7 +154,10 @@ class AutoFlowAnalysisRequest(BaseModel):
     story_context: dict[str, Any] = Field(default_factory=dict)
     segments: list[dict[str, Any]]
     analysis_prompt: str = Field(min_length=1, max_length=100_000)
+    reanalysis_prompt: str | None = Field(default=None, max_length=100_000)
+    previous_analysis: dict[str, Any] | None = None
     use_ai: bool = True
+    use_network_proxy: bool = False
 
 
 class AutoFlowRouteRequest(BaseModel):
@@ -158,8 +165,21 @@ class AutoFlowRouteRequest(BaseModel):
     assets: dict[str, Any] = Field(default_factory=dict)
     story_context: dict[str, Any] = Field(default_factory=dict)
     shot_groups: list[dict[str, Any]]
-    generation_mode: Literal["demo", "provider"] = "demo"
+    generation_mode: Literal["demo", "provider", "openrouter", "xingtu"] = "demo"
     image_model: str | None = Field(default=None, min_length=1, max_length=200)
+    routing_analysis_prompt: str = Field(
+        default="请逐镜头评估真实生成难度和能力需求，禁止直接选择模型。",
+        min_length=1,
+        max_length=100_000,
+    )
+    use_ai_difficulty: bool = True
+    use_network_proxy: bool = False
+
+
+class AutoFlowReferenceRegenerateRequest(BaseModel):
+    generation_mode: Literal["demo", "xingtu"] = "xingtu"
+    image_model: str | None = Field(default=None, min_length=1, max_length=200)
+    shot_ids: list[str] = Field(default_factory=list)
 
 
 class AutoFlowSubmitRequest(BaseModel):

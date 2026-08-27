@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -142,6 +144,101 @@ def _call_openrouter_image(
     return data, media_type, result.get("usage") or {}
 
 
+def _xingtu_request_payload(
+    prompt: str,
+    model: str,
+    aspect_ratio: str,
+    size: str,
+) -> dict[str, Any]:
+    ratio = (aspect_ratio or "9:16").strip() or "9:16"
+    return {
+        "model": model,
+        "prompt": f"【图片比例{ratio}】{prompt}",
+        "sequential_image_generation": "disabled",
+        "watermark": False,
+        "response_format": "url",
+        "size": size,
+        "output_format": "jpeg",
+    }
+
+
+def _station_lineart_prompt(prompt: str, state_label: str) -> str:
+    return (
+        f"竖屏 9:16 短剧分镜{state_label}站位线稿，黑白干净线描，白底，无上色，无阴影渲染，"
+        "人物位置、身体朝向、前中后景层次和镜头构图必须清晰，"
+        "保留必要环境轮廓与关键道具轮廓，禁止字幕、字卡、水印和额外文字。"
+        f"镜头状态：{prompt}"
+    )
+
+
+def _call_xingtu_image(
+    prompt: str,
+    model: str,
+    aspect_ratio: str,
+    size: str,
+) -> tuple[bytes, str, dict[str, Any]]:
+    if not settings.xingtu_image_api_key:
+        raise RuntimeError("未配置 XINGTU_IMAGE_API_KEY，无法执行星图 5.0 Pro 生图")
+    if size not in {"1K", "2K", "4K"}:
+        raise RuntimeError(f"星图图片尺寸必须是 1K、2K 或 4K，当前为：{size}")
+    request_payload = _xingtu_request_payload(
+        prompt, model, aspect_ratio, size
+    )
+    try:
+        with httpx.Client(timeout=300.0, follow_redirects=True) as client:
+            response = client.post(
+                settings.xingtu_image_endpoint,
+                headers={
+                    "Authorization": f"Bearer {settings.xingtu_image_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=request_payload,
+            )
+            if (
+                response.status_code == 400
+                and "sequential_image_generation" in response.text
+                and any(marker in response.text for marker in ("not supported", "InvalidParameter"))
+            ):
+                compatible_payload = dict(request_payload)
+                compatible_payload.pop("sequential_image_generation", None)
+                response = client.post(
+                    settings.xingtu_image_endpoint,
+                    headers={
+                        "Authorization": f"Bearer {settings.xingtu_image_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=compatible_payload,
+                )
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"星图 5.0 Pro 图片生成失败（HTTP {response.status_code}）：{response.text[:500]}"
+                )
+            result = response.json()
+            images = result.get("data") or []
+            if not images:
+                raise RuntimeError("星图 5.0 Pro 响应中没有 data")
+            item = images[0]
+            if item.get("url"):
+                image_url = str(item["url"])
+                parsed_url = urlparse(image_url)
+                if parsed_url.scheme not in {"https", "http"} or not parsed_url.netloc:
+                    raise RuntimeError("星图 5.0 Pro 返回了无效图片 URL")
+                image_response = client.get(image_url, timeout=120.0)
+                image_response.raise_for_status()
+                image_data = image_response.content
+                media_type = image_response.headers.get("content-type", "image/jpeg")
+            elif item.get("b64_json"):
+                image_data = base64.b64decode(item["b64_json"], validate=True)
+                media_type = str(item.get("media_type") or "image/jpeg")
+            else:
+                raise RuntimeError("星图 5.0 Pro 的 data[0] 中没有 url 或 b64_json")
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"星图 5.0 Pro 图片服务连接失败：{exc}") from exc
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(f"星图 5.0 Pro 返回数据无法解析：{exc}") from exc
+    return image_data, media_type, result.get("usage") or {}
+
+
 def _save_generated_image(job_id: str, role: str, data: bytes, media_type: str) -> tuple[str, str]:
     extension, normalized_mime = _raster_extension(data, media_type)
     filename = f"{job_id}_{role}{extension}"
@@ -194,6 +291,74 @@ def create_reference_image_pair_provider_job(
             "image_url": exit_url,
             "mime_type": exit_mime,
             "source_image_url": entry_url,
+        }
+    )
+    manifest_path = settings.work_root / "reference_images" / job_id / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return manifest
+
+
+def create_reference_image_pair_xingtu_job(payload: dict[str, Any]) -> dict[str, Any]:
+    provider_payload = dict(payload)
+    provider_payload["demo_case"] = False
+    manifest = create_reference_image_pair_job(provider_payload)
+    job_id = manifest["job_id"]
+    model = str(payload.get("image_model") or settings.xingtu_image_model).strip()
+    if not model:
+        raise RuntimeError("未配置星图 5.0 Pro 图片模型")
+    aspect_ratio = str(payload.get("aspect_ratio") or "9:16").strip() or "9:16"
+    size = str(payload.get("image_size") or settings.xingtu_image_size).strip().upper()
+
+    entry_prompt = _station_lineart_prompt(payload["entry_prompt_zh"], "开始")
+    exit_prompt = _station_lineart_prompt(payload["exit_prompt_zh"], "结束")
+    # 星图文生图是同步返回接口，但首尾两张线稿互不依赖，
+    # 因此同一镜头内并行发起两个同步请求。
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        entry_future = pool.submit(
+            _call_xingtu_image, entry_prompt, model, aspect_ratio, size
+        )
+        exit_future = pool.submit(
+            _call_xingtu_image, exit_prompt, model, aspect_ratio, size
+        )
+        entry_data, entry_mime, entry_usage = entry_future.result()
+        exit_data, exit_mime, exit_usage = exit_future.result()
+    entry_url, entry_mime = _save_generated_image(
+        job_id, "entry", entry_data, entry_mime
+    )
+    exit_url, exit_mime = _save_generated_image(job_id, "exit", exit_data, exit_mime)
+
+    manifest.update(
+        {
+            "status": "completed",
+            "generation_strategy": "parallel_synchronous_text_to_lineart_pair",
+            "generation_mode": "xingtu_text_to_image",
+            "provider": "volcengine_ark",
+            "image_model": model,
+            "aspect_ratio": aspect_ratio,
+            "size": size,
+            "message": (
+                "星图文生图同步接口已直接根据开始/结束状态文本，"
+                "并行生成两张竖屏黑白站位线稿；不使用 OpenRouter，也不要求上传资产图。"
+            ),
+            "usage": {"entry": entry_usage, "exit": exit_usage},
+        }
+    )
+    manifest["entry"].update(
+        {
+            "status": "completed",
+            "image_url": entry_url,
+            "mime_type": entry_mime,
+            "prompt_zh": entry_prompt,
+        }
+    )
+    manifest["exit"].update(
+        {
+            "status": "completed",
+            "image_url": exit_url,
+            "mime_type": exit_mime,
+            "prompt_zh": exit_prompt,
         }
     )
     manifest_path = settings.work_root / "reference_images" / job_id / "manifest.json"

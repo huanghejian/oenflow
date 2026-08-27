@@ -141,7 +141,7 @@
   },
   "model_registry": {
     "higgsfield-h3": {
-      "display_name": "H3",
+      "display_name": "MiniMax H3",
       "min_duration": 5,
       "max_duration": 15,
       "base_reliability": 0.79,

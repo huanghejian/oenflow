@@ -5,6 +5,7 @@ import importlib.util
 import json
 import re
 import sys
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -27,6 +28,7 @@ from .logging_utils import get_logger, log_event, log_payload
 from .reference_image_service import (
     create_reference_image_pair_job,
     create_reference_image_pair_provider_job,
+    create_reference_image_pair_xingtu_job,
 )
 from .workflow_service import (
     asset_reference_data_urls,
@@ -61,6 +63,7 @@ AUTOFLOW_ASSET_IDENTIFY_RESULT_PATH = settings.work_root / "autoflow_assets" / "
 AUTOFLOW_ASSET_PROMPT_RESULT_PATH = settings.work_root / "autoflow_assets" / "latest_prompts.json"
 AUTOFLOW_STORYBOARD_RESULT_PATH = settings.work_root / "autoflow_storyboard" / "latest.json"
 AUTOFLOW_ANALYSIS_RESULT_PATH = settings.work_root / "autoflow_analysis" / "latest.json"
+AUTOFLOW_ROUTE_RESULT_PATH = settings.work_root / "autoflow_routing" / "latest.json"
 _SCRIPT_MODULE_CACHE: dict[str, ModuleType] = {}
 logger = get_logger(__name__)
 
@@ -334,15 +337,14 @@ def _analysis_response_schema() -> dict[str, Any]:
     group = _object_schema(
         {
             "group_id": _string_schema(),
-            "group_type": {"type": "string", "enum": ["continuous_take", "min_duration_pack", "independent"]},
-            "source_segment_ids": _array_schema(_string_schema()),
+            "group_type": {
+                "type": "string",
+                "enum": ["continuous_take", "min_duration_pack", "independent"],
+            },
             "sub_shot_ids": _array_schema(_string_schema()),
-            "duration": _number_schema(),
             "reason": _string_schema(),
-            "entry_prompt_zh": _string_schema(),
-            "exit_prompt_zh": _string_schema(),
         },
-        ["group_id", "group_type", "source_segment_ids", "sub_shot_ids", "duration", "reason", "entry_prompt_zh", "exit_prompt_zh"],
+        ["group_id", "group_type", "sub_shot_ids", "reason"],
     )
     return _object_schema(
         {
@@ -350,6 +352,70 @@ def _analysis_response_schema() -> dict[str, Any]:
             "shot_groups": _array_schema(group),
         },
         ["summary", "shot_groups"],
+    )
+
+
+def _routing_difficulty_response_schema() -> dict[str, Any]:
+    requirement_level = {"type": "string", "enum": ["low", "medium", "high", "critical"]}
+    complexity_level = {"type": "string", "enum": ["low", "medium", "high"]}
+    score = {"type": "integer", "minimum": 0, "maximum": 100}
+    sub_shot_score = _object_schema(
+        {
+            "sub_shot_id": _string_schema(),
+            "difficulty_score": copy.deepcopy(score),
+            "overall_difficulty": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+            "dimension_scores": _object_schema(
+                {key: copy.deepcopy(score) for key in ROUTING_DIMENSIONS},
+                ROUTING_DIMENSIONS,
+            ),
+            "reason": _string_schema(),
+            "risks": _array_schema(_string_schema()),
+        },
+        [
+            "sub_shot_id",
+            "difficulty_score",
+            "overall_difficulty",
+            "dimension_scores",
+            "reason",
+            "risks",
+        ],
+    )
+    shot = _object_schema(
+        {
+            "group_id": _string_schema(),
+            "story_priority": {"type": "string", "enum": ["normal", "key", "climax"]},
+            "difficulty_score": copy.deepcopy(score),
+            "overall_difficulty": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+            "routing_requirements": _object_schema(
+                {key: copy.deepcopy(requirement_level) for key in ROUTING_DIMENSIONS},
+                ROUTING_DIMENSIONS,
+            ),
+            "complexity": _object_schema(
+                {key: copy.deepcopy(complexity_level) for key in COMPLEXITY_FIELDS},
+                COMPLEXITY_FIELDS,
+            ),
+            "reason": _string_schema(),
+            "risks": _array_schema(_string_schema()),
+            "sub_shot_scores": _array_schema(sub_shot_score),
+        },
+        [
+            "group_id",
+            "story_priority",
+            "difficulty_score",
+            "overall_difficulty",
+            "routing_requirements",
+            "complexity",
+            "reason",
+            "risks",
+            "sub_shot_scores",
+        ],
+    )
+    return _object_schema(
+        {
+            "summary": _string_schema(),
+            "shots": _array_schema(shot),
+        },
+        ["summary", "shots"],
     )
 
 
@@ -428,6 +494,7 @@ def _call_asset_llm_json(
     schema_name: str,
     schema: dict[str, Any],
     max_tokens: int | None = None,
+    use_network_proxy: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if settings.director_provider == "openrouter":
         return _call_openrouter_json(
@@ -442,6 +509,10 @@ def _call_asset_llm_json(
         raise RuntimeError("未配置 CLAUDE_CONVERSE_URL")
     if not settings.claude_converse_api_key:
         raise RuntimeError("未配置 CLAUDE_CONVERSE_API_KEY")
+    if use_network_proxy and not settings.claude_http_proxy_url:
+        raise RuntimeError(
+            "已选择网络代理，但后端未配置 CLAUDE_HTTP_PROXY_URL。"
+        )
 
     request_body: dict[str, Any] = {
         "system": [{"text": system_text}],
@@ -474,7 +545,7 @@ def _call_asset_llm_json(
         },
     )
     try:
-        response_data, response_id = post_json(
+        response_data, response_id, transient_retries = _post_claude_autoflow_with_retry(
             _bedrock_converse_url(
                 settings.claude_converse_url,
                 settings.claude_director_model,
@@ -482,7 +553,10 @@ def _call_asset_llm_json(
             ),
             request_body,
             f"Bearer {settings.claude_converse_api_key}",
-            {"x-request-id": uuid.uuid4().hex},
+            proxy_url=(
+                settings.claude_http_proxy_url if use_network_proxy else None
+            ),
+            force_direct=not use_network_proxy,
         )
     except LongTimeHttpError as exc:
         raise RuntimeError(
@@ -498,7 +572,9 @@ def _call_asset_llm_json(
     meta = {
         "response_id": response_id,
         "provider": "claude_converse",
+        "network_mode": "proxy" if use_network_proxy else "direct",
         "model": settings.claude_director_model,
+        "transient_retries": transient_retries,
         "usage": response_data.get("usage") if isinstance(response_data, dict) else None,
         "stop_reason": response_data.get("stopReason") if isinstance(response_data, dict) else None,
     }
@@ -508,6 +584,80 @@ def _call_asset_llm_json(
         {"schema_name": schema_name, "meta": meta, "parsed": parsed},
     )
     return parsed, meta
+
+
+CLAUDE_TRANSIENT_RETRY_DELAYS_SECONDS = (2.0, 6.0)
+
+
+def _is_transient_claude_failure(exc: Exception) -> bool:
+    if isinstance(exc, LongTimeHttpError):
+        if exc.status_code in {502, 503, 504}:
+            return True
+        body = str(exc.body or "").lower()
+        if exc.status_code == 500 and any(
+            marker in body
+            for marker in (
+                "bedrock api 返回 503",
+                "bedrock is unable to process your request",
+                'bedrock api 调用失败: bedrock api 返回 503',
+                '\\"statuscode\\":503',
+            )
+        ):
+            return True
+        return False
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "server disconnected without sending a response",
+            "longtimehttp 连接失败",
+            "connection reset by peer",
+        )
+    )
+
+
+def _post_claude_autoflow_with_retry(
+    url: str,
+    payload: dict[str, Any],
+    token: str,
+    *,
+    proxy_url: str | None,
+    force_direct: bool,
+    post_func: Any = post_json,
+    sleep_func: Any = time.sleep,
+) -> tuple[dict[str, Any], str | None, int]:
+    attempts = len(CLAUDE_TRANSIENT_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(attempts):
+        try:
+            data, response_id = post_func(
+                url,
+                payload,
+                token,
+                {"x-request-id": uuid.uuid4().hex},
+                proxy_url=proxy_url,
+                force_direct=force_direct,
+            )
+            return data, response_id, attempt
+        except (LongTimeHttpError, RuntimeError) as exc:
+            if not _is_transient_claude_failure(exc):
+                raise
+            if attempt >= attempts - 1:
+                raise RuntimeError(
+                    f"Claude/Bedrock 服务暂时繁忙，已自动重试 {attempts} 次仍失败；"
+                    "请稍后再试，或在页面切换直连/网络代理后重试当前环节。"
+                ) from exc
+            delay = CLAUDE_TRANSIENT_RETRY_DELAYS_SECONDS[attempt]
+            log_event(
+                logger,
+                "llm.claude_converse.transient_retry",
+                attempt=attempt + 1,
+                next_attempt=attempt + 2,
+                delay_seconds=delay,
+                status_code=(exc.status_code if isinstance(exc, LongTimeHttpError) else None),
+                reason=str(exc)[:500],
+            )
+            sleep_func(delay)
+    raise RuntimeError("Claude/Bedrock 短暂错误重试流程异常结束。")
 
 
 def _clean_id(value: Any, prefix: str, index: int) -> str:
@@ -999,7 +1149,9 @@ def _normalize_segments(raw_segments: list[Any]) -> list[dict[str, Any]]:
                 "items": _unique(list(data.get("items") or []) + [p for sub in normalized_subs for p in sub.get("items", [])]),
                 "shot_type": str(data.get("shot_type") or normalized_subs[0]["shot_type"]),
                 "camera_movement": str(data.get("camera_movement") or normalized_subs[0]["camera_movement"]),
-                "transition_from_previous": str(data.get("transition_from_previous") or ("scene_start" if index == 1 else "hard_cut")),
+                # An omitted boundary is unknown and must be judged by the
+                # shot-group analyzer; it is not automatically a hard cut.
+                "transition_from_previous": str(data.get("transition_from_previous") or ("scene_start" if index == 1 else "")),
                 "entry_state": str(data.get("entry_state") or normalized_subs[0]["entry_state"]),
                 "performance": str(data.get("performance") or "；".join(sub["performance"] for sub in normalized_subs if sub.get("performance"))),
                 "exit_state": str(data.get("exit_state") or normalized_subs[-1]["exit_state"]),
@@ -1141,6 +1293,7 @@ def split_script_assets_and_segments(
     story_context: dict[str, Any] | None = None,
     image_models: list[str] | None = None,
     use_ai: bool = True,
+    use_network_proxy: bool = False,
 ) -> dict[str, Any]:
     log_event(
         logger,
@@ -1170,6 +1323,7 @@ def split_script_assets_and_segments(
             None,
             image_models or [],
             use_ai,
+            use_network_proxy,
         )
     )
     storyboard_result = split_script_storyboard(
@@ -1179,6 +1333,7 @@ def split_script_assets_and_segments(
         asset_result.get("story_context") or {},
         storyboard_prompt or split_prompt,
         use_ai,
+        use_network_proxy,
     )
     result = {
         "assets": asset_result["assets"],
@@ -1203,6 +1358,7 @@ def split_script_assets(
     existing_assets: Any,
     image_models: list[str] | None,
     use_ai: bool,
+    use_network_proxy: bool = False,
 ) -> dict[str, Any]:
     log_event(
         logger,
@@ -1238,6 +1394,7 @@ def split_script_assets(
         },
         "autoflow_assets_identify",
         _agent_a_ledger_response_schema(),
+        use_network_proxy=use_network_proxy,
     )
     log_payload(logger, "autoflow.assets.split.raw_llm", raw)
 
@@ -1283,6 +1440,7 @@ def generate_asset_prompts(
     prompt_instruction: str,
     image_models: list[str] | None,
     use_ai: bool,
+    use_network_proxy: bool = False,
 ) -> dict[str, Any]:
     log_event(
         logger,
@@ -1318,6 +1476,7 @@ def generate_asset_prompts(
         },
         "autoflow_asset_prompts",
         _agent_b_prompt_response_schema(),
+        use_network_proxy=use_network_proxy,
     )
     log_payload(logger, "autoflow.assets.prompts.raw_llm", raw)
 
@@ -1410,6 +1569,7 @@ def split_script_storyboard(
     story_context: dict[str, Any],
     storyboard_prompt: str,
     use_ai: bool,
+    use_network_proxy: bool = False,
 ) -> dict[str, Any]:
     log_event(
         logger,
@@ -1427,7 +1587,7 @@ def split_script_storyboard(
         system_text = (
             "你是 Seedance 2.0 短剧分镜导演。请基于用户给定的资产清单和分镜提示词，"
             "只完成分镜结构组织与子镜头规划。禁止新增未在资产清单中的核心角色、场景、关键道具；"
-            "每个 segment 必须包含 sub_shots，sub_shots 是后续连续拍摄/4秒拼接/独立镜头组分析的基本单位。"
+            "每个 segment 必须包含 sub_shots，sub_shots 是后续判断连续拍摄与真实切镜边界的基本单位。"
             "输出需要保留 originalText、dialogues、animationPrompt、characters、scenes、items 等 ai-video 自动流兼容信息；"
             "同时规整成 segments/sub_shots 字段供后续步骤消费。必须只返回 JSON。"
         )
@@ -1444,7 +1604,8 @@ def split_script_storyboard(
                 },
                 "autoflow_storyboard_split",
                 _storyboard_response_schema(),
-                max_tokens=32000,
+                max_tokens=64000,
+                use_network_proxy=use_network_proxy,
             )
         except Exception as exc:
             logger.exception("autoflow.storyboard.split.llm_failed fallback_reason=%s", exc)
@@ -1507,21 +1668,87 @@ def _flatten_sub_shots(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "performance": sub.get("performance") or sub.get("content") or segment.get("performance") or "",
                     "exit_state": sub.get("exit_state") or segment.get("exit_state") or "",
                     "dialogue": sub.get("dialogue") or segment.get("dialogue") or {},
-                    "transition_from_previous": segment.get("transition_from_previous") or "hard_cut",
+                    "transition_from_previous": (
+                        sub.get("transition_from_previous")
+                        or sub.get("cut_in")
+                        or (
+                            segment.get("transition_from_previous")
+                            if sub_index == 1
+                            else ""
+                        )
+                    ),
                 }
             )
     return flattened
 
 
+HARD_CUT_MARKERS = {
+    "hard_cut",
+    "match_cut_action",
+    "match_cut_shape",
+    "concealed_cut",
+    "fade",
+    "emotional_cut",
+    "empty_shot",
+    "scene_start",
+    "scene_end",
+    "reaction_cut",
+    "reverse_shot",
+    "pov_cut",
+    "camera_cut",
+}
+CONTINUOUS_MARKERS = {"continuous", "no_cut", "same_take", "single_take"}
+
+
+def _boundary_marker(right: dict[str, Any]) -> str:
+    return str(
+        right.get("transition_from_previous") or right.get("cut_in") or ""
+    ).strip().lower()
+
+
+def _is_hard_cut_boundary(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if str(left.get("scene") or "") != str(right.get("scene") or ""):
+        return True
+    marker = _boundary_marker(right)
+    if marker in HARD_CUT_MARKERS:
+        return True
+    if marker in CONTINUOUS_MARKERS:
+        return False
+    return any(
+        token in marker
+        for token in ("硬切", "切镜", "反打", "机位切换", "视点切换", "匹配切", "隐藏切", "淡入", "淡出", "转场")
+    )
+
+
 def _needs_continuity(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    if left.get("indivisible") or right.get("indivisible"):
+    # indivisible only protects the inside of one sub-shot. It does not mean
+    # that the boundary to its neighbor must be removed.
+    if _is_hard_cut_boundary(left, right):
+        return False
+    if _boundary_marker(right) in CONTINUOUS_MARKERS:
+        return True
+    if left.get("continuous_with_next") or right.get("continuous_from_previous"):
         return True
     left_text = " ".join(str(left.get(k) or "") for k in ("performance", "exit_state", "continuity_hint"))
     right_text = " ".join(str(right.get(k) or "") for k in ("entry_state", "performance", "continuity_hint"))
-    continuity_tokens = ("继续", "连续", "同一动作", "不可切", "跟拍", "一镜", "转身", "走向", "冲向", "抬手", "落下")
-    if any(token in left_text + right_text for token in continuity_tokens):
-        return True
-    return bool(set(left.get("characters") or []) & set(right.get("characters") or [])) and left.get("scene") == right.get("scene") and left.get("duration", 0) < 4
+    continuity_tokens = (
+        "继续",
+        "接着",
+        "紧接",
+        "随即",
+        "动作延续",
+        "无切镜",
+        "连续运镜",
+        "同一长镜头",
+        "一镜到底",
+        "镜头继续",
+        "承接同一动作",
+        "动作尚未完成",
+        "动作未完成",
+        "不可在此切",
+        "必须连续拍摄",
+    )
+    return any(token in left_text + right_text for token in continuity_tokens)
 
 
 def _group_prompt(group: dict[str, Any], state: str) -> str:
@@ -1561,34 +1788,224 @@ def _finalize_group(items: list[dict[str, Any]], index: int, group_type: str, re
 
 def _fallback_analyze(segments: list[dict[str, Any]]) -> dict[str, Any]:
     subs = _flatten_sub_shots(segments)
-    groups: list[dict[str, Any]] = []
-    index = 1
-    cursor = 0
-    while cursor < len(subs):
-        current = subs[cursor]
-        bucket = [current]
-        duration = _to_seconds(current.get("duration"))
-        group_type = "independent" if duration >= 4 else "min_duration_pack"
-        reason = "单个子镜头已满足最小 4 秒，可以独立拍摄。" if duration >= 4 else "单个子镜头不足 4 秒，按最小时长规则向后拼接。"
-        while cursor + len(bucket) < len(subs):
-            nxt = subs[cursor + len(bucket)]
-            if _needs_continuity(bucket[-1], nxt):
-                group_type = "continuous_take"
-                reason = "相邻子镜头存在动作/空间/人物连续性，作为不可分割连续拍摄镜头组。"
-                bucket.append(nxt)
-                duration += _to_seconds(nxt.get("duration"))
-                continue
-            if duration < 4:
-                group_type = "min_duration_pack"
-                reason = "前段累计不足 4 秒，向后拼接形成可生成镜头组。"
-                bucket.append(nxt)
-                duration += _to_seconds(nxt.get("duration"))
-                continue
+    buckets: list[list[dict[str, Any]]] = []
+    for sub in subs:
+        if buckets and _needs_continuity(buckets[-1][-1], sub):
+            buckets[-1].append(sub)
+        else:
+            buckets.append([sub])
+
+    def bucket_duration(bucket: list[dict[str, Any]]) -> float:
+        return sum(_to_seconds(item.get("duration")) for item in bucket)
+
+    # Enforce the user's minimum generation-unit rule. A short unit first
+    # prefers a genuinely continuous neighbor; otherwise it is explicitly
+    # packaged across the nearest edit boundary as min_duration_pack.
+    while len(buckets) > 1:
+        short_index = next(
+            (index for index, bucket in enumerate(buckets) if bucket_duration(bucket) < 4),
+            None,
+        )
+        if short_index is None:
             break
+        options: list[tuple[int, int, int]] = []
+        if short_index > 0:
+            left = buckets[short_index - 1]
+            current = buckets[short_index]
+            continuity = int(_needs_continuity(left[-1], current[0]))
+            same_scene = int(str(left[-1].get("scene") or "") == str(current[0].get("scene") or ""))
+            options.append((continuity * 2 + same_scene, 0, short_index - 1))
+        if short_index + 1 < len(buckets):
+            current = buckets[short_index]
+            right = buckets[short_index + 1]
+            continuity = int(_needs_continuity(current[-1], right[0]))
+            same_scene = int(str(current[-1].get("scene") or "") == str(right[0].get("scene") or ""))
+            options.append((continuity * 2 + same_scene, 1, short_index + 1))
+        _, _, neighbor_index = max(options)
+        if neighbor_index < short_index:
+            buckets[neighbor_index].extend(buckets[short_index])
+            buckets.pop(short_index)
+        else:
+            buckets[short_index].extend(buckets[neighbor_index])
+            buckets.pop(neighbor_index)
+
+    groups: list[dict[str, Any]] = []
+    for index, bucket in enumerate(buckets, start=1):
+        duration = bucket_duration(bucket)
+        continuous = len(bucket) > 1 and all(
+            _needs_continuity(left, right) for left, right in zip(bucket, bucket[1:])
+        )
+        if continuous:
+            group_type = "continuous_take"
+            reason = (
+                "相邻小镜头属于同一段连续表演，动作、机位与主体状态能够直接承接；"
+                f"镜头组总时长 {duration:g} 秒。"
+            )
+        elif len(bucket) > 1:
+            group_type = "min_duration_pack"
+            reason = (
+                "组内并非全部属于同一段连续表演，但不足 4 秒的小镜头不能独立输出，"
+                f"已按剧情顺序与相邻镜头打包；组内保留真实切镜，总时长 {duration:g} 秒。"
+            )
+        elif duration >= 4:
+            group_type = "independent"
+            reason = f"单个小镜头时长 {duration:g} 秒，已达到 4 秒，可以独立生成。"
+        else:
+            group_type = "independent"
+            reason = f"整份输入仅有该镜头且总时长 {duration:g} 秒，没有其他相邻镜头可供合并。"
         groups.append(_finalize_group(bucket, index, group_type, reason))
-        cursor += len(bucket)
-        index += 1
     return {"summary": f"共分析 {len(subs)} 个子镜头，形成 {len(groups)} 个镜头组。", "shot_groups": groups}
+
+
+def _merge_short_analysis_groups(
+    raw_groups: dict[str, Any], subs: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Preserve the model's semantic groups while enforcing the 4-second floor."""
+    result = copy.deepcopy(raw_groups)
+    groups = [group for group in result.get("shot_groups") or [] if isinstance(group, dict)]
+    by_id = {str(item.get("id")): item for item in subs}
+
+    def group_items(group: dict[str, Any]) -> list[dict[str, Any]]:
+        return [by_id[str(sub_id)] for sub_id in group.get("sub_shot_ids") or [] if str(sub_id) in by_id]
+
+    def group_duration(group: dict[str, Any]) -> float:
+        return sum(_to_seconds(item.get("duration")) for item in group_items(group))
+
+    while len(groups) > 1:
+        short_index = next(
+            (index for index, group in enumerate(groups) if group_duration(group) < 4),
+            None,
+        )
+        if short_index is None:
+            break
+        options: list[tuple[int, int, int]] = []
+        current_items = group_items(groups[short_index])
+        if short_index > 0:
+            neighbor_items = group_items(groups[short_index - 1])
+            continuity = int(bool(neighbor_items and current_items) and _needs_continuity(neighbor_items[-1], current_items[0]))
+            same_scene = int(bool(neighbor_items and current_items) and str(neighbor_items[-1].get("scene") or "") == str(current_items[0].get("scene") or ""))
+            options.append((continuity * 2 + same_scene, 0, short_index - 1))
+        if short_index + 1 < len(groups):
+            neighbor_items = group_items(groups[short_index + 1])
+            continuity = int(bool(neighbor_items and current_items) and _needs_continuity(current_items[-1], neighbor_items[0]))
+            same_scene = int(bool(neighbor_items and current_items) and str(current_items[-1].get("scene") or "") == str(neighbor_items[0].get("scene") or ""))
+            options.append((continuity * 2 + same_scene, 1, short_index + 1))
+        _, _, neighbor_index = max(options)
+        left_index, right_index = sorted((short_index, neighbor_index))
+        left_group, right_group = groups[left_index], groups[right_index]
+        left_items, right_items = group_items(left_group), group_items(right_group)
+        boundary_continuous = bool(left_items and right_items) and _needs_continuity(left_items[-1], right_items[0])
+        merged_type = (
+            "continuous_take"
+            if boundary_continuous
+            and left_group.get("group_type") != "min_duration_pack"
+            and right_group.get("group_type") != "min_duration_pack"
+            else "min_duration_pack"
+        )
+        merged_ids = [
+            str(sub_id)
+            for group in (left_group, right_group)
+            for sub_id in group.get("sub_shot_ids") or []
+        ]
+        merged_duration = sum(
+            _to_seconds(by_id[sub_id].get("duration"))
+            for sub_id in merged_ids
+            if sub_id in by_id
+        )
+        merged_reason = (
+            f"不足 4 秒的镜头组已与相邻同一段连续表演合并，总时长 {merged_duration:g} 秒。"
+            if merged_type == "continuous_take"
+            else f"不足 4 秒的镜头组已按剧情顺序与相邻镜头打包，组内保留真实切镜，总时长 {merged_duration:g} 秒。"
+        )
+        groups[left_index] = {
+            "group_id": left_group.get("group_id"),
+            "group_type": merged_type,
+            "sub_shot_ids": merged_ids,
+            "reason": merged_reason,
+        }
+        groups.pop(right_index)
+
+    for index, group in enumerate(groups, start=1):
+        group["group_id"] = f"g{index:03d}"
+    result["shot_groups"] = groups
+    result["summary"] = f"共分析 {len(subs)} 个子镜头，按 4 秒最小时长形成 {len(groups)} 个镜头组。"
+    return result
+
+
+def _validate_group_partition(raw_groups: dict[str, Any], subs: list[dict[str, Any]]) -> None:
+    """Ensure the model returns one ordered, lossless partition of the sub-shots."""
+    expected_ids = [str(item.get("id")) for item in subs]
+    position_by_id = {sub_id: index for index, sub_id in enumerate(expected_ids)}
+    returned_ids: list[str] = []
+    total_duration = sum(_to_seconds(item.get("duration")) for item in subs)
+    groups = raw_groups.get("shot_groups")
+    if not isinstance(groups, list) or not groups:
+        raise RuntimeError("镜头组分析结果未返回 shot_groups。")
+
+    for group_index, raw_group in enumerate(groups, start=1):
+        ids = [str(item) for item in raw_group.get("sub_shot_ids") or []]
+        group_type = str(raw_group.get("group_type") or "")
+        if not ids:
+            raise RuntimeError(f"第 {group_index} 个镜头组没有子镜头。")
+        unknown_ids = [sub_id for sub_id in ids if sub_id not in position_by_id]
+        if unknown_ids:
+            raise RuntimeError(f"镜头组包含未知子镜头：{unknown_ids}")
+        positions = [position_by_id[sub_id] for sub_id in ids]
+        if positions != list(range(positions[0], positions[0] + len(positions))):
+            raise RuntimeError(f"镜头组 {ids} 不是原始顺序中的相邻子镜头。")
+        for left_position, right_position in zip(positions, positions[1:]):
+            if group_type != "min_duration_pack" and _is_hard_cut_boundary(subs[left_position], subs[right_position]):
+                raise RuntimeError(
+                    f"镜头组跨越了真实切镜边界：{expected_ids[left_position]} -> {expected_ids[right_position]}"
+                )
+        group_duration = sum(_to_seconds(subs[position].get("duration")) for position in positions)
+        if total_duration >= 4 and group_duration < 4:
+            raise RuntimeError(
+                f"镜头组 {ids} 总时长仅 {group_duration:g} 秒；不足 4 秒的镜头组必须与相邻镜头合并。"
+            )
+        returned_ids.extend(ids)
+
+    if returned_ids != expected_ids:
+        missing_ids = [sub_id for sub_id in expected_ids if sub_id not in returned_ids]
+        duplicate_ids = sorted(
+            sub_id for sub_id in set(returned_ids) if returned_ids.count(sub_id) > 1
+        )
+        raise RuntimeError(
+            "镜头组必须按原顺序完整覆盖全部子镜头："
+            f"缺失={missing_ids or '无'}，重复={duplicate_ids or '无'}"
+        )
+
+
+def _materialize_analysis_groups(
+    raw_groups: dict[str, Any], ordered_sub_shots: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    by_sub_id = {str(item.get("id")): item for item in ordered_sub_shots}
+    groups: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_groups.get("shot_groups") or [], start=1):
+        ids = [str(value) for value in raw.get("sub_shot_ids") or []]
+        items = [by_sub_id[sub_id] for sub_id in ids if sub_id in by_sub_id]
+        if not items:
+            continue
+        raw_group_type = str(raw.get("group_type") or "")
+        group_type = (
+            "independent"
+            if len(items) == 1
+            else "min_duration_pack"
+            if raw_group_type == "min_duration_pack"
+            else "continuous_take"
+        )
+        group = _finalize_group(
+            items,
+            index,
+            group_type,
+            str(raw.get("reason") or "模型分析结果"),
+        )
+        if raw.get("entry_prompt_zh"):
+            group["entry_prompt_zh"] = str(raw["entry_prompt_zh"])
+        if raw.get("exit_prompt_zh"):
+            group["exit_prompt_zh"] = str(raw["exit_prompt_zh"])
+        groups.append(group)
+    return groups
 
 
 def analyze_shot_groups(
@@ -1597,7 +2014,10 @@ def analyze_shot_groups(
     story_context: dict[str, Any],
     segments: list[dict[str, Any]],
     analysis_prompt: str,
+    reanalysis_prompt: str | None,
+    previous_analysis: dict[str, Any] | None,
     use_ai: bool,
+    use_network_proxy: bool = False,
 ) -> dict[str, Any]:
     log_event(
         logger,
@@ -1605,55 +2025,100 @@ def analyze_shot_groups(
         use_ai=use_ai,
         segment_count=len(segments),
         analysis_prompt_length=len(analysis_prompt),
+        reanalysis_prompt_length=len(reanalysis_prompt or ""),
+        has_previous_analysis=bool(previous_analysis),
     )
     normalized_segments = _normalize_segments(segments)
+    ordered_sub_shots = _flatten_sub_shots(normalized_segments)
     fallback = _fallback_analyze(normalized_segments)
     meta: dict[str, Any] = {"provider": "deterministic", "model": None}
     raw_groups = fallback
     if use_ai:
         system_text = (
-            "你是短剧镜头组分析助手。你的任务是判断哪些子镜头必须连续拍摄不可分割，"
-            "哪些因不足最小4秒需要向后拼接，哪些可以独立成为镜头组。"
-            "只返回 JSON，不得改写剧情顺序。"
+            "你是短剧视频镜头组分析器。ordered_sub_shots 中的小镜头已经是最小分割单元，禁止继续拆解；"
+            "必须阅读每个小镜头的完整内容、时长、动作、机位、视点、场景、人物及进出状态后再分组。"
+            "核心判断是相邻小镜头是否属于同一段连续表演：动作、台词、呼吸、视线、情绪、行为意图和身体状态是否自然延续，"
+            "演员是否无需停下、复位、改变表演目标或重新起拍。景别或运镜名称变化不等于真实切镜；"
+            "只要摄影机能通过连续推拉、摇移、跟拍或变焦完成画面变化，就仍应按连续表演合并。"
+            "同一动作的准备、发生、结果，以及一句台词前后的连续动作反应，应优先组成同一个 continuous_take。"
+            "单个小镜头时长达到 4 秒时可以独立成为 independent。单镜头或镜头组小于 4 秒时禁止独立输出，"
+            "必须优先与属于同一段连续表演的前后相邻镜头合并，直到总时长达到或超过 4 秒；"
+            "如果动作、机位、视点、时空和主体状态连续，并且边界处没有真实切镜点，就按原顺序合并为 continuous_take，"
+            "可继续吸收后续连续镜头，使整组时长达到或超过 4 秒。"
+            "明确硬切、反打、主体视点跳转、无法连续完成的机位切换、匹配切、隐藏切、淡入淡出、时空跳跃、"
+            "主体状态不连续，或演员必须复位和改变表演目标时才切开；"
+            "如果不足 4 秒且前后都存在真实切镜点，仍必须与剧情关系更紧密的相邻镜头打包，group_type 使用 min_duration_pack，"
+            "并在 reason 中明确组内保留真实切镜，不得伪装成 continuous_take。"
+            "除非整份输入总时长本身不足 4 秒，否则最终不得出现时长小于 4 秒的镜头组。"
+            "人物或场景相同、小于 4 秒都不能单独证明可合并；必须同时满足连续拍摄条件。"
+            "结果必须按输入顺序完整覆盖每个小镜头且不重不漏。只返回 JSON，不生成首尾帧提示词，不改写剧情。"
         )
+        if previous_analysis and reanalysis_prompt:
+            system_text += (
+                "这是一次修订任务。请以现有镜头组为基线，严格执行重新分析要求；"
+                "要求中可用 s001 或 g001 等编号指定目标。未被点名的内容尽量保持不变，"
+                "但最终仍须返回覆盖全部子镜头的完整 shot_groups，不得只返回局部结果。"
+            )
         try:
             raw_groups, meta = _call_asset_llm_json(
                 system_text,
                 {
-                    "project_params": project_params,
-                    "assets": assets,
-                    "story_context": story_context,
-                    "segments": normalized_segments,
+                    "project_constraints": {
+                        "aspect_ratio": project_params.get("aspect_ratio"),
+                        "resolution": project_params.get("resolution"),
+                        "global_visual_lock": project_params.get("global_visual_lock"),
+                        "minimum_generation_duration_seconds": 4,
+                    },
+                    "ordered_sub_shots": ordered_sub_shots,
                     "analysis_prompt": analysis_prompt,
-                    "deterministic_baseline": fallback,
+                    "reanalysis_prompt": reanalysis_prompt or "",
+                    "previous_analysis": {
+                        "summary": previous_analysis.get("summary"),
+                        "shot_groups": [
+                            {
+                                "group_id": group.get("group_id"),
+                                "group_type": group.get("group_type"),
+                                "sub_shot_ids": group.get("sub_shot_ids") or [],
+                                "reason": group.get("reason"),
+                            }
+                            for group in previous_analysis.get("shot_groups") or []
+                        ],
+                    }
+                    if previous_analysis
+                    else None,
                 },
                 "autoflow_shot_group_analysis",
                 _analysis_response_schema(),
                 max_tokens=24000,
+                use_network_proxy=use_network_proxy,
             )
+            raw_groups = _merge_short_analysis_groups(raw_groups, ordered_sub_shots)
+            _validate_group_partition(raw_groups, ordered_sub_shots)
         except Exception as exc:
+            if previous_analysis and reanalysis_prompt:
+                logger.exception("autoflow.analyze_shot_groups.reanalysis_failed")
+                raise RuntimeError(f"重新分析镜头组失败: {exc}") from exc
             meta = {"provider": "deterministic_fallback", "model": None, "fallback_reason": str(exc)}
             logger.exception("autoflow.analyze_shot_groups.llm_failed fallback_reason=%s", exc)
             raw_groups = fallback
 
-    by_sub_id = {str(item.get("id")): item for item in _flatten_sub_shots(normalized_segments)}
-    groups: list[dict[str, Any]] = []
-    for index, raw in enumerate(raw_groups.get("shot_groups") or [], start=1):
-        ids = [str(x) for x in raw.get("sub_shot_ids") or []]
-        items = [by_sub_id[x] for x in ids if x in by_sub_id]
-        if not items:
-            continue
-        group = _finalize_group(
-            items,
-            index,
-            str(raw.get("group_type") or "independent"),
-            str(raw.get("reason") or "模型分析结果"),
+    by_sub_id = {str(item.get("id")): item for item in ordered_sub_shots}
+    groups = _materialize_analysis_groups(raw_groups, ordered_sub_shots)
+    if previous_analysis and reanalysis_prompt:
+        returned_ids = [
+            str(sub_id)
+            for group in groups
+            for sub_id in group.get("sub_shot_ids") or []
+        ]
+        missing_ids = sorted(set(by_sub_id) - set(returned_ids))
+        duplicate_ids = sorted(
+            sub_id for sub_id in set(returned_ids) if returned_ids.count(sub_id) > 1
         )
-        if raw.get("entry_prompt_zh"):
-            group["entry_prompt_zh"] = str(raw["entry_prompt_zh"])
-        if raw.get("exit_prompt_zh"):
-            group["exit_prompt_zh"] = str(raw["exit_prompt_zh"])
-        groups.append(group)
+        if missing_ids or duplicate_ids:
+            raise RuntimeError(
+                "重新分析结果未完整覆盖子镜头："
+                f"缺失={missing_ids or '无'}，重复={duplicate_ids or '无'}"
+            )
     if not groups:
         groups = fallback["shot_groups"]
     result = {
@@ -1683,6 +2148,29 @@ def load_latest_analysis_result() -> dict[str, Any]:
     )
     if not isinstance(result.get("shot_groups"), list):
         raise RuntimeError("保存的镜头组分析结果结构无效。")
+    if isinstance(result.get("segments"), list):
+        normalized_segments = _normalize_segments(result["segments"])
+        ordered_sub_shots = _flatten_sub_shots(normalized_segments)
+        raw_groups = {
+            "summary": result.get("summary"),
+            "shot_groups": [
+                {
+                    "group_id": group.get("group_id"),
+                    "group_type": group.get("group_type"),
+                    "sub_shot_ids": group.get("sub_shot_ids") or [],
+                    "reason": group.get("reason"),
+                }
+                for group in result.get("shot_groups") or []
+                if isinstance(group, dict)
+            ],
+        }
+        raw_groups = _merge_short_analysis_groups(raw_groups, ordered_sub_shots)
+        _validate_group_partition(raw_groups, ordered_sub_shots)
+        result["segments"] = normalized_segments
+        result["shot_groups"] = _materialize_analysis_groups(
+            raw_groups, ordered_sub_shots
+        )
+        result["summary"] = raw_groups["summary"]
     log_event(logger, "autoflow.analysis.latest.loaded", path=str(AUTOFLOW_ANALYSIS_RESULT_PATH))
     return result
 
@@ -1735,6 +2223,245 @@ def _reference_assets(scene_id: str, role_ids: list[str], prop_ids: list[str]) -
     return {"required": {"images": images}, "optional": {"images": []}}
 
 
+ROUTING_REQUIREMENT_LEVELS = {"low", "medium", "high", "critical"}
+ROUTING_COMPLEXITY_LEVELS = {"low", "medium", "high"}
+ROUTING_LEVEL_SCORES = {"low": 25, "medium": 50, "high": 75, "critical": 95}
+
+
+def _score_to_difficulty(score: int) -> str:
+    if score >= 86:
+        return "critical"
+    if score >= 66:
+        return "high"
+    if score >= 41:
+        return "medium"
+    return "low"
+
+
+def _dimension_scores_from_requirements(requirements: dict[str, str]) -> dict[str, int]:
+    return {
+        key: ROUTING_LEVEL_SCORES.get(str(requirements.get(key) or "low"), 25)
+        for key in ROUTING_DIMENSIONS
+    }
+
+
+def _overall_numeric_score(dimension_scores: dict[str, int]) -> int:
+    values = [int(dimension_scores.get(key) or 0) for key in ROUTING_DIMENSIONS]
+    if not values:
+        return 0
+    # 既体现整体生成负担，也让单项极难维度能够拉高路由风险。
+    return max(0, min(100, round((sum(values) / len(values)) * 0.7 + max(values) * 0.3)))
+
+
+def _fallback_sub_shot_score(group: dict[str, Any], sub: dict[str, Any]) -> dict[str, Any]:
+    sub_group = {
+        "group_type": "independent",
+        "duration": _to_seconds(sub.get("duration")),
+        "sub_shots": [sub],
+    }
+    requirements = _requirements_for_group(sub_group)
+    dimension_scores = _dimension_scores_from_requirements(requirements)
+    score = _overall_numeric_score(dimension_scores)
+    risks = [
+        f"{ROUTING_DIMENSION_LABELS.get(key, key)} {value} 分"
+        for key, value in dimension_scores.items()
+        if value >= 75
+    ]
+    return {
+        "sub_shot_id": str(sub.get("id") or ""),
+        "difficulty_score": score,
+        "overall_difficulty": _score_to_difficulty(score),
+        "dimension_scores": dimension_scores,
+        "reason": "根据该小镜头的人物、台词、动作、运镜、道具与时长独立评分。",
+        "risks": risks,
+    }
+
+
+def _compact_group_for_difficulty(group: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "group_id": group.get("group_id"),
+        "group_type": group.get("group_type"),
+        "duration": group.get("duration"),
+        "reason": group.get("reason"),
+        "scene": group.get("scene_asset"),
+        "sub_shots": [
+            {
+                "id": sub.get("id"),
+                "duration": sub.get("duration"),
+                "content": sub.get("content"),
+                "performance": sub.get("performance"),
+                "shot_type": sub.get("shot_type"),
+                "camera_movement": sub.get("camera_movement"),
+                "characters": sub.get("characters") or [],
+                "items": sub.get("items") or [],
+                "dialogue": sub.get("dialogue") or {},
+                "entry_state": sub.get("entry_state"),
+                "exit_state": sub.get("exit_state"),
+            }
+            for sub in group.get("sub_shots") or []
+        ],
+    }
+
+
+def _fallback_routing_difficulty(shot_groups: list[dict[str, Any]]) -> dict[str, Any]:
+    shots: list[dict[str, Any]] = []
+    for group in shot_groups:
+        requirements = _requirements_for_group(group)
+        complexity = _complexity_for_group(group)
+        sub_shot_scores = [
+            _fallback_sub_shot_score(group, sub)
+            for sub in group.get("sub_shots") or []
+        ]
+        dimension_scores = _dimension_scores_from_requirements(requirements)
+        group_score = _overall_numeric_score(dimension_scores)
+        if sub_shot_scores:
+            group_score = max(group_score, max(item["difficulty_score"] for item in sub_shot_scores))
+        overall = _score_to_difficulty(group_score)
+        shots.append(
+            {
+                "group_id": str(group.get("group_id") or ""),
+                "story_priority": "key" if group.get("group_type") == "continuous_take" else "normal",
+                "difficulty_score": group_score,
+                "overall_difficulty": overall,
+                "routing_requirements": requirements,
+                "complexity": complexity,
+                "reason": "根据镜头时长、人物数量、动作、台词和连续性规则确定性评估。",
+                "risks": [],
+                "sub_shot_scores": sub_shot_scores,
+            }
+        )
+    sub_count = sum(len(item.get("sub_shot_scores") or []) for item in shots)
+    return {"summary": f"已对 {sub_count} 个小镜头逐镜打分，并汇总为 {len(shots)} 个镜头组路由难度。", "shots": shots}
+
+
+def _aggregate_sub_shot_difficulty(result: dict[str, Any]) -> dict[str, Any]:
+    """把逐镜头分数确定性汇总到镜头组，确保真实路由不会忽略组内高难镜头。"""
+    normalized = copy.deepcopy(result)
+    for shot in normalized.get("shots") or []:
+        sub_scores = [item for item in shot.get("sub_shot_scores") or [] if isinstance(item, dict)]
+        if not sub_scores:
+            continue
+        max_sub_score = max(int(item.get("difficulty_score") or 0) for item in sub_scores)
+        shot["difficulty_score"] = max(int(shot.get("difficulty_score") or 0), max_sub_score)
+        shot["overall_difficulty"] = _score_to_difficulty(int(shot["difficulty_score"]))
+        requirements = shot.setdefault("routing_requirements", {})
+        for key in ROUTING_DIMENSIONS:
+            max_dimension_score = max(
+                int((item.get("dimension_scores") or {}).get(key) or 0)
+                for item in sub_scores
+            )
+            sub_level = _score_to_difficulty(max_dimension_score)
+            current_level = str(requirements.get(key) or "low")
+            requirements[key] = max(
+                (current_level, sub_level),
+                key=lambda value: ROUTING_LEVEL_ORDER.get(value, 0),
+            )
+    return normalized
+
+
+def _validate_routing_difficulty(
+    result: dict[str, Any], shot_groups: list[dict[str, Any]]
+) -> None:
+    expected_ids = [str(group.get("group_id") or "") for group in shot_groups]
+    shots = result.get("shots")
+    if not isinstance(shots, list):
+        raise RuntimeError("镜头难度分析未返回 shots。")
+    returned_ids = [str(shot.get("group_id") or "") for shot in shots]
+    if returned_ids != expected_ids:
+        raise RuntimeError("镜头难度分析必须按原顺序完整覆盖全部镜头组。")
+    group_by_id = {str(group.get("group_id") or ""): group for group in shot_groups}
+    for shot in shots:
+        requirements = shot.get("routing_requirements") or {}
+        complexity = shot.get("complexity") or {}
+        if set(requirements) != set(ROUTING_DIMENSIONS):
+            raise RuntimeError(f"镜头 {shot.get('group_id')} 的路由需求维度不完整。")
+        if set(complexity) != set(COMPLEXITY_FIELDS):
+            raise RuntimeError(f"镜头 {shot.get('group_id')} 的复杂度维度不完整。")
+        if any(value not in ROUTING_REQUIREMENT_LEVELS for value in requirements.values()):
+            raise RuntimeError(f"镜头 {shot.get('group_id')} 返回了无效路由需求等级。")
+        if any(value not in ROUTING_COMPLEXITY_LEVELS for value in complexity.values()):
+            raise RuntimeError(f"镜头 {shot.get('group_id')} 返回了无效复杂度等级。")
+        group_score = shot.get("difficulty_score")
+        if not isinstance(group_score, int) or isinstance(group_score, bool) or not 0 <= group_score <= 100:
+            raise RuntimeError(f"镜头组 {shot.get('group_id')} 的难度分必须是 0-100 整数。")
+        group = group_by_id.get(str(shot.get("group_id") or "")) or {}
+        expected_sub_ids = [str(sub.get("id") or "") for sub in group.get("sub_shots") or []]
+        sub_scores = shot.get("sub_shot_scores")
+        if not isinstance(sub_scores, list):
+            raise RuntimeError(f"镜头组 {shot.get('group_id')} 未返回逐镜头评分。")
+        returned_sub_ids = [str(item.get("sub_shot_id") or "") for item in sub_scores]
+        if returned_sub_ids != expected_sub_ids:
+            raise RuntimeError(f"镜头组 {shot.get('group_id')} 必须按原顺序完整覆盖每个小镜头。")
+        for item in sub_scores:
+            score = item.get("difficulty_score")
+            if not isinstance(score, int) or isinstance(score, bool) or not 0 <= score <= 100:
+                raise RuntimeError(f"小镜头 {item.get('sub_shot_id')} 的难度分必须是 0-100 整数。")
+            dimension_scores = item.get("dimension_scores") or {}
+            if set(dimension_scores) != set(ROUTING_DIMENSIONS):
+                raise RuntimeError(f"小镜头 {item.get('sub_shot_id')} 的逐维度分数不完整。")
+            if any(
+                not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 100
+                for value in dimension_scores.values()
+            ):
+                raise RuntimeError(f"小镜头 {item.get('sub_shot_id')} 返回了无效的维度分数。")
+        if sub_scores and group_score < max(int(item["difficulty_score"]) for item in sub_scores):
+            raise RuntimeError(f"镜头组 {shot.get('group_id')} 的汇总难度分不得低于组内最难小镜头。")
+
+
+def _analyze_routing_difficulty(
+    project_params: dict[str, Any],
+    shot_groups: list[dict[str, Any]],
+    routing_analysis_prompt: str,
+    use_ai: bool,
+    use_network_proxy: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    fallback = _aggregate_sub_shot_difficulty(_fallback_routing_difficulty(shot_groups))
+    if not use_ai:
+        return fallback, {"provider": "deterministic", "model": None}
+    system_text = (
+        "你是短剧视频生成难度分析器。必须对每个镜头组内的每一个 sub_shot 分别独立打分，"
+        "每个小镜头返回 0-100 难度总分、十项 0-100 维度分、难度等级、理由和风险；"
+        "再为镜头组返回 0-100 汇总难度分与路由能力要求。组分不得低于组内最难的小镜头。"
+        "但绝对不要选择、推荐或输出任何具体模型和 preset；模型选择由后续确定性路由器完成。"
+        "必须根据实际动作、表演、口型、多角色控制、身份一致性、物理交互、运镜、道具、特效和时序连续性评估，"
+        "不得因为用户指定了某档位而虚高或压低难度。按输入顺序完整覆盖全部 group_id 及其 sub_shot.id，不得遗漏或重复，只返回 JSON。"
+    )
+    try:
+        result, meta = _call_asset_llm_json(
+            system_text,
+            {
+                "project_constraints": {
+                    "routing_tier": project_params.get("routing_tier"),
+                    "resolution": project_params.get("resolution"),
+                    "aspect_ratio": project_params.get("aspect_ratio"),
+                },
+                "routing_analysis_prompt": routing_analysis_prompt,
+                "shot_groups": [_compact_group_for_difficulty(group) for group in shot_groups],
+                "dimension_guide": {
+                    "routing_requirements": ROUTING_DIMENSIONS,
+                    "complexity": COMPLEXITY_FIELDS,
+                    "requirement_levels": ["low", "medium", "high", "critical"],
+                    "complexity_levels": ["low", "medium", "high"],
+                    "score_range": "所有 difficulty_score 和 dimension_scores 都是 0-100 整数",
+                },
+            },
+            "autoflow_routing_difficulty",
+            _routing_difficulty_response_schema(),
+            max_tokens=24000,
+            use_network_proxy=use_network_proxy,
+        )
+        result = _aggregate_sub_shot_difficulty(result)
+        _validate_routing_difficulty(result, shot_groups)
+        return result, meta
+    except Exception as exc:
+        logger.exception("autoflow.routing_difficulty.llm_failed fallback_reason=%s", exc)
+        return fallback, {
+            "provider": "deterministic_fallback",
+            "model": None,
+            "fallback_reason": str(exc),
+        }
+
+
 def _requirements_for_group(group: dict[str, Any]) -> dict[str, str]:
     text = json.dumps(group, ensure_ascii=False)
     req = {key: "low" for key in ROUTING_DIMENSIONS}
@@ -1758,19 +2485,37 @@ def _complexity_for_group(group: dict[str, Any]) -> dict[str, str]:
     return {key: level for key in COMPLEXITY_FIELDS}
 
 
-def _to_generation_unit(group: dict[str, Any], assets: dict[str, Any]) -> dict[str, Any]:
+def _to_generation_unit(
+    group: dict[str, Any],
+    assets: dict[str, Any],
+    difficulty_analysis: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     maps = _asset_name_to_id_maps(assets)
-    role_ids = _unique([maps["characters"].get(str(c), str(c)) for sub in group.get("sub_shots", []) for c in sub.get("characters", [])])
-    prop_ids = _unique([maps["items"].get(str(p), str(p)) for sub in group.get("sub_shots", []) for p in sub.get("items", [])])
+    role_ids = _unique(
+        [
+            maps["characters"][str(character)]
+            for sub in group.get("sub_shots", [])
+            for character in sub.get("characters", [])
+            if str(character) in maps["characters"]
+        ]
+    )
+    prop_ids = _unique(
+        [
+            maps["items"][str(prop)]
+            for sub in group.get("sub_shots", [])
+            for prop in sub.get("items", [])
+            if str(prop) in maps["items"]
+        ]
+    )
     scene_name = str(group.get("scene_asset") or (group.get("sub_shots") or [{}])[0].get("scene") or "主场景")
     scene_id = maps["scenes"].get(scene_name, scene_name)
     cursor = 0
-    timeline: list[dict[str, Any]] = []
+    sub_timelines: list[dict[str, Any]] = []
     for index, sub in enumerate(group.get("sub_shots") or [], start=1):
         duration = _to_seconds(sub.get("duration"))
         start, end = cursor, cursor + duration
         cursor = end
-        timeline.append(
+        sub_timelines.append(
             {
                 "type": "atomic",
                 "atomic_id": str(sub.get("id") or f"{group.get('group_id')}_c{index:02d}"),
@@ -1813,28 +2558,83 @@ def _to_generation_unit(group: dict[str, Any], assets: dict[str, Any]) -> dict[s
             }
         )
     group_type = str(group.get("group_type") or "independent")
-    return {
-        "unit_id": str(group.get("group_id") or uuid.uuid4().hex[:8]),
-        "atomic_ids": [seg["atomic_id"] for seg in timeline],
-        "group_ids": [str(group.get("group_id") or "")],
+    difficulty = difficulty_analysis or {}
+    group_id = str(group.get("group_id") or uuid.uuid4().hex[:8])
+    narrative_classes = _unique([seg["narrative_class"] for seg in sub_timelines])
+    narrative_functions = [seg["narrative_function"] for seg in sub_timelines]
+    beats = [
+        {
+            "sub_shot_id": seg["atomic_id"],
+            "start": seg["start"],
+            "end": seg["end"],
+            "content": seg["narrative_function"],
+            "shot_size": (seg.get("camera_plan") or {}).get("shot_size"),
+            "camera_movement": (seg.get("camera_plan") or {}).get("movement"),
+        }
+        for seg in sub_timelines
+    ]
+    first_segment = sub_timelines[0] if sub_timelines else {}
+    last_segment = sub_timelines[-1] if sub_timelines else {}
+    timeline_lines = [
+        f"{seg['start']:g}-{seg['end']:g}秒：{(seg.get('prompt_core') or {}).get('timeline_local') or seg.get('narrative_function') or '保持本镜动作'}"
+        for seg in sub_timelines
+    ]
+    if group_type == "min_duration_pack" and len(timeline_lines) > 1:
+        timeline_lines.insert(0, "本生成单元包含多个编辑镜头，按下列时间节拍保留组内真实切镜。")
+    combined_segment = {
+        "type": "atomic",
+        "atomic_id": group_id,
+        "start": 0,
+        "end": cursor,
         "scene_asset": scene_id,
-        "story_priority": "key" if group_type == "continuous_take" else "normal",
-        "narrative_classes": _unique([seg["narrative_class"] for seg in timeline]),
-        "narrative_functions": [seg["narrative_function"] for seg in timeline],
+        "narrative_class": narrative_classes[0] if len(narrative_classes) == 1 else "mixed",
+        "narrative_function": "；".join(narrative_functions) or "剧情推进",
+        "camera_plan": {
+            "shot_size": " → ".join(_unique([(seg.get("camera_plan") or {}).get("shot_size") for seg in sub_timelines])) or "中景",
+            "angle": "按各小镜头设定",
+            "composition": "主体清晰，保持短剧竖屏构图与组内站位连续",
+            "movement": " → ".join(_unique([(seg.get("camera_plan") or {}).get("movement") for seg in sub_timelines])) or "固定镜头",
+        },
+        "prompt_core": {
+            "timeline_local": "\n".join(timeline_lines) or "保持本镜动作",
+            "guardrail": "不新增剧本以外的角色、道具和动作。",
+        },
+        "asset_refs": {"roles": role_ids, "props": prop_ids},
+        "reference_assets": _reference_assets(scene_id, role_ids, prop_ids),
+        "continuity": {
+            "entry": (first_segment.get("continuity") or {}).get("entry") or "",
+            "exit": (last_segment.get("continuity") or {}).get("exit") or "",
+            "los": "按小镜头时间节拍保持动作与视线关系",
+        },
+        "spatial_state": copy.deepcopy(first_segment.get("spatial_state") or {}),
+        "scale_plan": copy.deepcopy(first_segment.get("scale_plan") or {}),
+    }
+    is_single_take = group_type != "min_duration_pack"
+    return {
+        "unit_id": group_id,
+        "atomic_ids": [group_id],
+        "source_sub_shot_ids": [seg["atomic_id"] for seg in sub_timelines],
+        "group_ids": [group_id],
+        "scene_asset": scene_id,
+        "story_priority": difficulty.get("story_priority") or ("key" if group_type == "continuous_take" else "normal"),
+        "narrative_classes": narrative_classes,
+        "narrative_functions": narrative_functions,
         "content_duration": cursor,
         "duration": cursor,
         "padding_plan": {"before": 0, "after": 0},
         "asset_refs": {"roles": role_ids, "props": prop_ids},
-        "routing_requirements": _requirements_for_group(group),
-        "complexity": _complexity_for_group(group),
+        "routing_requirements": difficulty.get("routing_requirements") or _requirements_for_group(group),
+        "complexity": difficulty.get("complexity") or _complexity_for_group(group),
+        "difficulty_analysis": copy.deepcopy(difficulty),
         "continuity": {
             "entry": group.get("entry_prompt_zh") or "",
             "exit": group.get("exit_prompt_zh") or "",
             "los": str(group.get("reason") or ""),
         },
-        "timeline_segments": timeline,
-        "single_take": False,
-        "indivisible": False,
+        "timeline_segments": [combined_segment],
+        "beats": beats,
+        "single_take": is_single_take,
+        "indivisible": is_single_take,
         "independent_generation": True,
         "autoflow_group": copy.deepcopy(group),
     }
@@ -1863,10 +2663,245 @@ def _ensure_reference_assets(final_video_plan: dict[str, Any]) -> None:
             )
 
 
+ROUTING_MODEL_ORDER = ["seedance-2.0", "seedance-2.5", "higgsfield-h3", "wan-3.0"]
+ROUTING_MODEL_LABELS = {
+    "seedance-2.0": "Seedance 2.0",
+    "seedance-2.5": "Seedance 2.5",
+    "higgsfield-h3": "MiniMax H3",
+    "wan-3.0": "Wan 3.0",
+}
+ROUTING_MODEL_STRENGTHS = {
+    "seedance-2.0": "口型、人物身份一致性和连续表演较均衡",
+    "seedance-2.5": "复杂表演、多人互动、动作与长时序连续性最强",
+    "higgsfield-h3": "运镜和动作表现突出，并兼顾低成本生成",
+    "wan-3.0": "环境特效和较长镜头生成更有优势",
+}
+ROUTING_LEVEL_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+ROUTING_DIMENSION_LABELS = {
+    "acting_precision": "表演精度",
+    "dialogue_lipsync": "台词口型",
+    "identity_consistency": "身份一致性",
+    "multi_character_control": "多人控制",
+    "motion_action": "动作强度",
+    "physical_interaction": "物理互动",
+    "camera_control": "运镜控制",
+    "prop_precision": "道具精度",
+    "vfx_environment": "特效环境",
+    "temporal_continuity": "时序连续性",
+}
+
+
+def _difficulty_for_routing_unit(unit: dict[str, Any]) -> dict[str, Any]:
+    difficulty = copy.deepcopy(unit.get("difficulty_analysis") or {})
+    if difficulty:
+        return difficulty
+    requirements = unit.get("routing_requirements") or {}
+    levels = [
+        str(value)
+        for value in requirements.values()
+        if str(value) in ROUTING_LEVEL_ORDER
+    ]
+    overall = max(levels, key=lambda value: ROUTING_LEVEL_ORDER[value]) if levels else "low"
+    risks = [
+        f"{ROUTING_DIMENSION_LABELS.get(key, key)}为{('关键高难' if value == 'critical' else '高难')}"
+        for key, value in requirements.items()
+        if value in {"high", "critical"}
+    ]
+    return {
+        "story_priority": unit.get("story_priority") or "normal",
+        "overall_difficulty": overall,
+        "reason": "根据该镜头十项路由需求中的最高等级生成确定性难度结论。",
+        "risks": risks,
+    }
+
+
+def _human_hard_reason(reason: str) -> str:
+    value = str(reason or "")
+    if value.startswith("preset_output_resolution_mismatch"):
+        return "输出分辨率与项目要求不一致"
+    if value.startswith("target_resolution_not_allowed"):
+        return "该 preset 不支持项目分辨率"
+    if value.startswith("preset_duration>") or value.startswith("duration>"):
+        return "镜头时长超过接口上限"
+    if value.startswith("preset_duration<") or value.startswith("duration<"):
+        return "镜头时长低于接口下限"
+    if value.startswith("required_image_count_exceeded"):
+        return "必需参考图片数量超过接口容量"
+    if value.startswith("required_video_count_exceeded"):
+        return "必需参考视频数量超过接口容量"
+    if value.startswith("required_audio_count_exceeded"):
+        return "必需参考音频数量超过接口容量"
+    if value.startswith("required_total_files_exceeded"):
+        return "必需素材总数超过接口容量"
+    if value.startswith("sr_shot_size_forbidden") or value == "requires_all_closeup":
+        return "SR 仅支持全段特写或大特写"
+    if value == "wide_shot_forbidden":
+        return "该 preset 不支持宽景别"
+    if value == "has_people_forbidden":
+        return "该 preset 不支持人物镜头"
+    if value == "preset_disabled":
+        return "该 preset 当前已停用"
+    if value.startswith("invalid_pricing"):
+        return "价格配置无效"
+    return value or "不满足接口硬约束"
+
+
+def _representative_candidate(
+    model_candidates: list[dict[str, Any]],
+    selected_model: str,
+    selected_preset: str,
+) -> dict[str, Any] | None:
+    for candidate in model_candidates:
+        if candidate.get("model") == selected_model and candidate.get("preset") == selected_preset:
+            return candidate
+    qualified = [candidate for candidate in model_candidates if candidate.get("qualified")]
+    if qualified:
+        return max(
+            qualified,
+            key=lambda item: (
+                float(item.get("tier_score") or 0),
+                float(item.get("fit_quality") or 0),
+                float(item.get("reliability") or 0),
+                -float(item.get("expected_usable_points") or 10**9),
+            ),
+        )
+    if not model_candidates:
+        return None
+    return min(
+        model_candidates,
+        key=lambda item: (
+            len(item.get("hard_reasons") or []),
+            -float(item.get("fit_quality") or 0),
+        ),
+    )
+
+
+def _selected_model_reason(
+    decision: dict[str, Any],
+    difficulty: dict[str, Any],
+    representative_by_model: dict[str, dict[str, Any] | None],
+) -> str:
+    selected_model = str(decision.get("selected_model") or "")
+    selected = representative_by_model.get(selected_model) or {}
+    label = ROUTING_MODEL_LABELS.get(selected_model, selected_model or "当前模型")
+    preset = str(decision.get("selected_preset") or selected.get("preset") or "默认 preset")
+    quality = float(decision.get("fit_quality") or selected.get("fit_quality") or 0)
+    reliability = float(decision.get("reliability") or selected.get("reliability") or 0)
+    points = float(decision.get("expected_usable_points") or selected.get("expected_usable_points") or 0)
+    level = {
+        "low": "低难度",
+        "medium": "中等难度",
+        "high": "高难度",
+        "critical": "关键高难",
+    }.get(str(difficulty.get("overall_difficulty") or ""), "当前难度")
+    tier = str(decision.get("tier") or "medium")
+    if tier == "low":
+        policy_reason = "在通过接口硬约束与低档质量底线的方案中，预计可用积分更低"
+    elif tier == "high":
+        policy_reason = "处于接近最高质量的候选集合，并在质量、可靠性和成本之间更优"
+    elif decision.get("medium_target_met"):
+        target = decision.get("medium_target_quality")
+        floor = decision.get("medium_reliability_floor")
+        policy_reason = f"达到中档目标质量 {target} 和可靠性底线 {floor}，且在达标方案中预计可用积分更优"
+    else:
+        policy_reason = "当前没有候选同时达到中档目标，选择了最接近目标且成本可控的方案"
+    return (
+        f"该镜头判定为{level}。{label} 的优势是{ROUTING_MODEL_STRENGTHS.get(selected_model, '综合能力与当前镜头匹配')}。"
+        f"选择 {label} / {preset}：适配分 {quality:.2f}，"
+        f"可靠性 {reliability * 100:.1f}%，预计可用积分 {points:.2f}；{policy_reason}。"
+    )
+
+
+def _model_comparison(
+    decision: dict[str, Any], difficulty: dict[str, Any]
+) -> tuple[list[dict[str, Any]], str]:
+    raw_candidates = [
+        candidate
+        for candidate in decision.get("candidates") or []
+        if isinstance(candidate, dict)
+    ]
+    selected_model = str(decision.get("selected_model") or "")
+    selected_preset = str(decision.get("selected_preset") or "")
+    representative_by_model = {
+        model: _representative_candidate(
+            [candidate for candidate in raw_candidates if candidate.get("model") == model],
+            selected_model,
+            selected_preset,
+        )
+        for model in ROUTING_MODEL_ORDER
+    }
+    selected_reason = _selected_model_reason(
+        decision, difficulty, representative_by_model
+    )
+    selected = representative_by_model.get(selected_model) or {}
+    rows: list[dict[str, Any]] = []
+    for model in ROUTING_MODEL_ORDER:
+        candidate = representative_by_model.get(model)
+        if candidate is None:
+            rows.append(
+                {
+                    "model": model,
+                    "display_name": ROUTING_MODEL_LABELS[model],
+                    "qualified": False,
+                    "selected": False,
+                    "verdict": "unavailable",
+                    "why": "当前路由配置未返回该模型候选。",
+                    "hard_reasons": ["model_candidate_unavailable"],
+                }
+            )
+            continue
+        qualified = bool(candidate.get("qualified"))
+        is_selected = model == selected_model and candidate.get("preset") == selected_preset
+        reasons = [_human_hard_reason(reason) for reason in candidate.get("hard_reasons") or []]
+        if is_selected:
+            why = selected_reason
+            verdict = "selected"
+        elif not qualified:
+            why = "；".join(reasons) or "未通过接口硬约束。"
+            verdict = "rejected"
+        else:
+            quality_delta = float(candidate.get("fit_quality") or 0) - float(selected.get("fit_quality") or 0)
+            cost_delta = float(candidate.get("expected_usable_points") or 0) - float(selected.get("expected_usable_points") or 0)
+            reliability_delta = float(candidate.get("reliability") or 0) - float(selected.get("reliability") or 0)
+            comparisons = []
+            if quality_delta < -0.01:
+                comparisons.append(f"适配分低 {abs(quality_delta):.2f}")
+            elif quality_delta > 0.01:
+                comparisons.append(f"适配分高 {quality_delta:.2f}，但未赢得当前档位综合裁决")
+            if cost_delta > 0.01:
+                comparisons.append(f"预计积分高 {cost_delta:.2f}")
+            if reliability_delta < -0.001:
+                comparisons.append(f"可靠性低 {abs(reliability_delta) * 100:.1f} 个百分点")
+            why = "；".join(comparisons) or "模型可用，但当前档位综合得分未超过入选方案。"
+            verdict = "qualified"
+        rows.append(
+            {
+                "model": model,
+                "display_name": ROUTING_MODEL_LABELS[model],
+                "preset": candidate.get("preset"),
+                "qualified": qualified,
+                "selected": is_selected,
+                "verdict": verdict,
+                "fit_quality": candidate.get("fit_quality"),
+                "reliability": candidate.get("reliability"),
+                "call_points": candidate.get("call_points"),
+                "expected_usable_points": candidate.get("expected_usable_points"),
+                "hard_reasons": reasons,
+                "why": why,
+            }
+        )
+    return rows, selected_reason
+
+
 def _build_routing_analysis(routed_plan: dict[str, Any]) -> dict[str, Any]:
     shots = []
     for unit in routed_plan.get("routed_units", []) or []:
         decision = copy.deepcopy(unit.get("routing_decision") or {})
+        difficulty = _difficulty_for_routing_unit(unit)
+        comparison, selected_reason = _model_comparison(decision, difficulty)
+        selected_model = str(decision.get("selected_model") or "")
+        if selected_model in ROUTING_MODEL_LABELS:
+            decision["selected_display_name"] = ROUTING_MODEL_LABELS[selected_model]
         candidates = []
         for candidate in decision.get("candidates") or []:
             compact = {
@@ -1891,13 +2926,18 @@ def _build_routing_analysis(routed_plan: dict[str, Any]) -> dict[str, Any]:
             compact["selected"] = candidate.get("model") == decision.get("selected_model") and candidate.get("preset") == decision.get("selected_preset")
             candidates.append(compact)
         decision["candidates"] = candidates
+        decision["model_comparison"] = comparison
+        decision["selection_reason"] = selected_reason
         shots.append(
             {
                 "shot_id": unit.get("unit_id"),
                 "atomic_ids": unit.get("atomic_ids", []),
+                "source_sub_shot_ids": unit.get("source_sub_shot_ids", []),
                 "source_group": (unit.get("autoflow_group") or {}).get("group_id"),
                 "duration": unit.get("duration"),
                 "routing_requirements": unit.get("routing_requirements", {}),
+                "complexity": unit.get("complexity", {}),
+                "difficulty_analysis": difficulty,
                 "routing_decision": decision,
             }
         )
@@ -1914,6 +2954,7 @@ def _generate_reference_for_shot(
     shot: dict[str, Any],
     generation_mode: str,
     image_model: str | None,
+    aspect_ratio: str,
 ) -> dict[str, Any]:
     image_plan = shot.get("reference_image_plan") or {}
     output_ids = image_plan.get("output_asset_ids") or {}
@@ -1927,7 +2968,9 @@ def _generate_reference_for_shot(
         input_asset_ids=input_ids,
     )
     missing = missing_asset_ids(input_ids)
-    if missing:
+    # 星图站位线稿为纯文生图，不消费输入资产图；只有
+    # OpenRouter/provider 的图生图编辑模式才必须先完成资产绑定。
+    if missing and generation_mode in {"provider", "openrouter"}:
         result = {"shot_id": shot.get("shot_id"), "status": "blocked", "missing_asset_ids": missing}
         log_payload(logger, "autoflow.reference.generate_shot.blocked", result)
         return result
@@ -1941,17 +2984,21 @@ def _generate_reference_for_shot(
         "continuity_source_shot_id": image_plan.get("continuity_source_shot_id"),
         "demo_case": generation_mode == "demo",
         "image_model": image_model,
-        "aspect_ratio": "9:16",
+        "aspect_ratio": aspect_ratio or "9:16",
     }
     if not payload["entry_prompt_zh"] or not payload["exit_prompt_zh"]:
         result = {"shot_id": shot.get("shot_id"), "status": "blocked", "detail": "缺少首帧或尾帧提示词"}
         log_payload(logger, "autoflow.reference.generate_shot.blocked", result)
         return result
-    if generation_mode == "provider":
+    if generation_mode == "xingtu":
+        manifest = create_reference_image_pair_xingtu_job(payload)
+    elif generation_mode in {"provider", "openrouter"}:
         manifest = create_reference_image_pair_provider_job(payload, asset_reference_data_urls(input_ids))
     else:
         manifest = create_reference_image_pair_job(payload)
     manifest["input_asset_ids"] = input_ids
+    if missing and generation_mode == "xingtu":
+        manifest["unused_missing_asset_ids"] = missing
     manifest["registry"] = register_reference_pair(manifest)
     log_payload(logger, "autoflow.reference.generate_shot.result", manifest)
     return manifest
@@ -1964,6 +3011,9 @@ def route_and_generate_references(
     shot_groups: list[dict[str, Any]],
     generation_mode: str,
     image_model: str | None,
+    routing_analysis_prompt: str,
+    use_ai_difficulty: bool = True,
+    use_network_proxy: bool = False,
 ) -> dict[str, Any]:
     log_event(
         logger,
@@ -1971,8 +3021,21 @@ def route_and_generate_references(
         shot_group_count=len(shot_groups),
         generation_mode=generation_mode,
         image_model=image_model,
+        routing_analysis_prompt_length=len(routing_analysis_prompt),
+        use_ai_difficulty=use_ai_difficulty,
         project_params=project_params,
     )
+    difficulty_result, difficulty_meta = _analyze_routing_difficulty(
+        project_params,
+        shot_groups,
+        routing_analysis_prompt,
+        use_ai_difficulty,
+        use_network_proxy,
+    )
+    difficulty_by_group = {
+        str(item.get("group_id") or ""): item
+        for item in difficulty_result.get("shots") or []
+    }
     video_router = _load_script_module("video_router")
     prompt_compiler = _load_script_module("prompt_compiler")
     registry, policy, config_source = video_router.load_config(str(settings.model_registry_path))
@@ -1989,7 +3052,14 @@ def route_and_generate_references(
             }
             for scene in _normalize_assets(assets)["scenes"]
         ],
-        "generation_units": [_to_generation_unit(group, assets) for group in shot_groups],
+        "generation_units": [
+            _to_generation_unit(
+                group,
+                assets,
+                difficulty_by_group.get(str(group.get("group_id") or "")),
+            )
+            for group in shot_groups
+        ],
     }
     catalog = _asset_catalog(assets)
     routed_plan = video_router.route_document(
@@ -2007,19 +3077,43 @@ def route_and_generate_references(
     references: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     episode_id = str(project_params.get("episode_id") or "EP001")
+    aspect_ratio = str(project_params.get("aspect_ratio") or "9:16")
     max_workers = min(4, max(1, len(final_video_plan.get("shots", []) or [])))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [
-            pool.submit(_generate_reference_for_shot, episode_id, shot, generation_mode, image_model)
+        futures = {
+            pool.submit(
+                _generate_reference_for_shot,
+                episode_id,
+                shot,
+                generation_mode,
+                image_model,
+                aspect_ratio,
+            ): shot
             for shot in final_video_plan.get("shots", []) or []
-        ]
+        }
         for future in as_completed(futures):
-            result = future.result()
+            shot = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "shot_id": shot.get("shot_id"),
+                    "status": "blocked",
+                    "detail": str(exc),
+                }
+                logger.exception(
+                    "autoflow.reference.generate_shot.failed shot_id=%s",
+                    shot.get("shot_id"),
+                )
             if result.get("status") == "blocked":
                 blocked.append(result)
             else:
                 references.append(result)
     result = {
+        "difficulty_analysis": {
+            **difficulty_result,
+            "llm": difficulty_meta,
+        },
         "routing_analysis": _build_routing_analysis(routed_plan),
         "final_video_plan": final_video_plan,
         "reference_generation": {
@@ -2029,6 +3123,12 @@ def route_and_generate_references(
             "blocked": blocked,
             "generation_mode": generation_mode,
         },
+        "source_context": {
+            "project_params": project_params,
+            "assets": assets,
+            "story_context": story_context,
+            "shot_groups": shot_groups,
+        },
     }
     log_event(
         logger,
@@ -2037,7 +3137,165 @@ def route_and_generate_references(
         completed_count=len(references),
         blocked_count=len(blocked),
     )
+    _save_step_result(AUTOFLOW_ROUTE_RESULT_PATH, result, "autoflow.routing.saved")
     log_payload(logger, "autoflow.route_and_generate_refs.result", result)
+    return result
+
+
+def load_latest_route_result() -> dict[str, Any]:
+    try:
+        result = _load_step_result(
+            AUTOFLOW_ROUTE_RESULT_PATH,
+            missing_message="尚未保存路由与首尾帧结果，请先点击“执行路由 + 生成首尾线稿”。",
+            invalid_message="保存的路由与首尾帧结果不是有效 JSON。",
+        )
+    except FileNotFoundError:
+        result = _restore_latest_route_result_from_debug_artifacts()
+    routing_analysis = result.get("routing_analysis")
+    final_video_plan = result.get("final_video_plan")
+    reference_generation = result.get("reference_generation")
+    if not isinstance(routing_analysis, dict) or not isinstance(routing_analysis.get("shots"), list):
+        raise RuntimeError("保存的路由与首尾帧结果缺少有效的路由分析。")
+    if not isinstance(final_video_plan, dict) or not isinstance(final_video_plan.get("shots"), list):
+        raise RuntimeError("保存的路由与首尾帧结果缺少有效的视频镜头计划。")
+    if not isinstance(reference_generation, dict):
+        raise RuntimeError("保存的路由与首尾帧结果缺少有效的首尾帧生成状态。")
+    if not isinstance(reference_generation.get("completed", []), list) or not isinstance(
+        reference_generation.get("blocked", []), list
+    ):
+        raise RuntimeError("保存的路由与首尾帧结果结构无效。")
+    log_event(logger, "autoflow.routing.latest.loaded", path=str(AUTOFLOW_ROUTE_RESULT_PATH))
+    return result
+
+
+def _restore_latest_route_result_from_debug_artifacts() -> dict[str, Any]:
+    debug_root = settings.work_root / "debug_logs"
+    candidates = sorted(
+        debug_root.glob("*/*_autoflow.route_and_generate_refs.result.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    ) if debug_root.is_dir() else []
+    for result_path in candidates:
+        try:
+            envelope = json.loads(result_path.read_text(encoding="utf-8"))
+            result = envelope.get("payload") if isinstance(envelope, dict) else None
+            if not isinstance(result, dict):
+                continue
+            if not isinstance(result.get("routing_analysis"), dict):
+                continue
+            if not isinstance(result.get("final_video_plan"), dict):
+                continue
+            if not isinstance(result.get("reference_generation"), dict):
+                continue
+
+            request_candidates = sorted(
+                result_path.parent.glob("*_autoflow.route_and_generate_refs.request.json"),
+                key=lambda path: path.stat().st_mtime_ns,
+                reverse=True,
+            )
+            if request_candidates:
+                request_envelope = json.loads(request_candidates[0].read_text(encoding="utf-8"))
+                request_payload = request_envelope.get("payload") if isinstance(request_envelope, dict) else None
+                if isinstance(request_payload, dict):
+                    result["source_context"] = {
+                        "project_params": request_payload.get("project_params") or {},
+                        "assets": request_payload.get("assets") or {},
+                        "story_context": request_payload.get("story_context") or {},
+                        "shot_groups": request_payload.get("shot_groups") or [],
+                    }
+            _save_step_result(AUTOFLOW_ROUTE_RESULT_PATH, result, "autoflow.routing.restored")
+            log_event(logger, "autoflow.routing.restored_from_debug", source=str(result_path))
+            return result
+        except (OSError, json.JSONDecodeError):
+            logger.warning("autoflow.routing.restore_skipped path=%s", result_path, exc_info=True)
+    raise FileNotFoundError("尚未保存路由与首尾帧结果，请先点击“执行路由 + 生成首尾线稿”。")
+
+
+def regenerate_latest_reference_images(
+    generation_mode: str,
+    image_model: str | None,
+    shot_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    result = load_latest_route_result()
+    final_video_plan = result.get("final_video_plan") or {}
+    all_shots = [shot for shot in final_video_plan.get("shots") or [] if isinstance(shot, dict)]
+    requested_ids = {str(value).strip() for value in shot_ids or [] if str(value).strip()}
+    target_shots = [
+        shot for shot in all_shots
+        if not requested_ids or str(shot.get("shot_id") or "") in requested_ids
+    ]
+    if not target_shots:
+        raise ValueError("没有找到可重新生成首尾帧的视频镜头。")
+
+    source_context = result.get("source_context") or {}
+    project_params = source_context.get("project_params") or {}
+    episode_id = str(project_params.get("episode_id") or "EP001")
+    aspect_ratio = str(
+        project_params.get("aspect_ratio")
+        or final_video_plan.get("aspect_ratio")
+        or "9:16"
+    )
+    completed_by_id = {
+        str(item.get("shot_id") or ""): item
+        for item in (result.get("reference_generation") or {}).get("completed") or []
+        if isinstance(item, dict) and item.get("shot_id")
+    }
+    blocked_by_id = {
+        str(item.get("shot_id") or ""): item
+        for item in (result.get("reference_generation") or {}).get("blocked") or []
+        if isinstance(item, dict) and item.get("shot_id")
+    }
+    target_ids = {str(shot.get("shot_id") or "") for shot in target_shots}
+    for shot_id in target_ids:
+        completed_by_id.pop(shot_id, None)
+        blocked_by_id.pop(shot_id, None)
+
+    max_workers = min(4, max(1, len(target_shots)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(
+                _generate_reference_for_shot,
+                episode_id,
+                shot,
+                generation_mode,
+                image_model,
+                aspect_ratio,
+            ): shot
+            for shot in target_shots
+        }
+        for future in as_completed(futures):
+            shot = futures[future]
+            shot_id = str(shot.get("shot_id") or "")
+            try:
+                manifest = future.result()
+            except Exception as exc:
+                logger.exception("autoflow.reference.regenerate.failed shot_id=%s", shot_id)
+                manifest = {"shot_id": shot_id, "status": "blocked", "detail": str(exc)}
+            if manifest.get("status") == "blocked":
+                blocked_by_id[shot_id] = manifest
+            else:
+                completed_by_id[shot_id] = manifest
+
+    ordered_ids = [str(shot.get("shot_id") or "") for shot in all_shots]
+    completed = [completed_by_id[shot_id] for shot_id in ordered_ids if shot_id in completed_by_id]
+    blocked = [blocked_by_id[shot_id] for shot_id in ordered_ids if shot_id in blocked_by_id]
+    result["reference_generation"] = {
+        "completed_count": len(completed),
+        "blocked_count": len(blocked),
+        "completed": completed,
+        "blocked": blocked,
+        "generation_mode": generation_mode,
+        "regenerated_only": True,
+        "regenerated_shot_count": len(target_shots),
+    }
+    _save_step_result(AUTOFLOW_ROUTE_RESULT_PATH, result, "autoflow.references.regenerated.saved")
+    log_event(
+        logger,
+        "autoflow.references.regenerated",
+        target_count=len(target_shots),
+        completed_count=len(completed),
+        blocked_count=len(blocked),
+    )
     return result
 
 
