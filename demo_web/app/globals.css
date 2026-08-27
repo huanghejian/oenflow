@@ -3011,28 +3011,6 @@ textarea:focus {
 
 .frameGenerateButton:disabled { border-color:#c9c5d2; color:#88828f; background:#e2dfe7; cursor:not-allowed; }
 
-.r2GenerationNotice {
-  margin:0 18px 16px;
-  padding:14px 16px;
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  gap:16px;
-  border:1px solid #d7d0ec;
-  border-radius:10px;
-  background:#f7f4ff;
-}
-
-.r2GenerationNotice strong,
-.r2GenerationNotice span { display:block; }
-.r2GenerationNotice strong { color:#30284a; font-size:12px; }
-.r2GenerationNotice span { margin-top:5px; color:#6e687b; font-size:9px; }
-.r2GenerationNotice b { color:#6f4ee6; font-size:9px; white-space:nowrap; }
-.r2GenerationNotice.ready { border-color:#9ed2b8; background:#f2fbf6; }
-.r2GenerationNotice.ready b { color:#24784e; }
-.r2GenerationNotice.blocked { border-color:#e4aaa4; background:#fff7f5; }
-.r2GenerationNotice.blocked b { color:#a34f47; }
-
 .frameSlot {
   position:relative;
   transition:border-color .2s ease, box-shadow .2s ease;
@@ -3888,7 +3866,7 @@ button.frameSlotStatus:disabled {
 }
 
 .submitShotList .frameSlots.compact .frameSlotCanvas {
-  height:clamp(520px, 58vw, 760px);
+  height:250px;
   background:#15131b;
 }
 
@@ -3902,7 +3880,7 @@ button.frameSlotStatus:disabled {
 .submitShotList .frameSlots.compact .frameSlot.state-uploaded,
 .submitShotList .frameSlots.compact .frameSlot.state-uploading,
 .submitShotList .frameSlots.compact .frameSlot.state-generating {
-  height:clamp(520px, 58vw, 760px);
+  height:250px;
   display:flex;
   flex-direction:column;
 }
@@ -3911,9 +3889,9 @@ button.frameSlotStatus:disabled {
 .submitShotList .frameSlots.compact .frameSlot.state-uploaded .frameSlotCanvas,
 .submitShotList .frameSlots.compact .frameSlot.state-uploading .frameSlotCanvas,
 .submitShotList .frameSlots.compact .frameSlot.state-generating .frameSlotCanvas {
-  flex:1 1 auto;
+  flex:0 0 250px;
   min-height:0;
-  height:auto;
+  height:250px;
   display:flex;
   align-items:center;
   justify-content:center;

@@ -67,7 +67,7 @@ const FLOW_STEPS: Array<{ id: FlowStep; index: string; title: string; caption: s
   { id: "assets", index: "03", title: "拆分镜", caption: "资产 / 分镜提示词" },
   { id: "analysis", index: "04", title: "镜头组分析", caption: "连续镜头与切镜边界" },
   { id: "routing", index: "05", title: "路由与首尾帧", caption: "路由、生图并行执行" },
-  { id: "submit", index: "06", title: "首尾帧融合", caption: "自动/手动重生 · 视频提交" },
+  { id: "submit", index: "06", title: "视频生成", caption: "自动/手动重生 · 视频提交" },
   { id: "compose", index: "07", title: "视频合成", caption: "ffmpeg 合并分镜视频" },
   { id: "finale", index: "08", title: "终章", caption: "查看完整成片" },
 ];
@@ -208,12 +208,6 @@ function displayImageUrl(imageUrl: string): string {
   return isHttpUrl(imageUrl) ? imageUrl : `${API_BASE}${imageUrl}`;
 }
 
-function imageExtension(contentType: string): string {
-  if (contentType.includes("jpeg") || contentType.includes("jpg")) return "jpg";
-  if (contentType.includes("webp")) return "webp";
-  return "png";
-}
-
 function assetLookupText(value?: string): string {
   return (value || "")
     .replace(/\.(png|jpe?g|webp|gif)$/i, "")
@@ -322,66 +316,6 @@ function normalizeReferenceManifest(manifest: ReferenceManifest, assetUrlLookup:
     ...manifest,
     entry: patchFrame(manifest.entry),
     exit: patchFrame(manifest.exit),
-  };
-}
-
-function patchReferenceFrameInRouteResult(
-  current: RouteResponse | null,
-  shot: FinalShot,
-  role: ReferenceFrameRole,
-  record: AssetRecord,
-): RouteResponse | null {
-  if (!current) return current;
-  const key = shotKey(shot);
-  const assetId = record.asset_id || (role === "entry" ? shot.reference_image_plan?.output_asset_ids?.entry : shot.reference_image_plan?.output_asset_ids?.exit) || "";
-  const registeredUrl = record.public_url || record.image_url || record.url || "";
-  const patchManifest = (manifest: ReferenceManifest): ReferenceManifest => {
-    if (manifest.shot_id !== key) return manifest;
-    return {
-      ...manifest,
-      status: "completed",
-      [role]: {
-        ...(manifest[role] || {}),
-        asset_id: assetId || manifest[role]?.asset_id,
-        image_url: registeredUrl || manifest[role]?.image_url,
-        url: registeredUrl || manifest[role]?.url,
-        public_url: registeredUrl || manifest[role]?.public_url,
-        s3_key: record.s3_key || manifest[role]?.s3_key,
-        status: "uploaded",
-      },
-    };
-  };
-  const completed = current.reference_generation?.completed || [];
-  const exists = completed.some((manifest) => manifest.shot_id === key);
-  const nextCompleted = exists
-    ? completed.map(patchManifest)
-    : [
-      ...completed,
-      patchManifest({
-        shot_id: key,
-        status: "completed",
-        [role]: { asset_id: assetId, image_url: registeredUrl, url: registeredUrl, public_url: registeredUrl, s3_key: record.s3_key, status: "uploaded" },
-      }),
-    ];
-  const nextShots = (current.final_video_plan?.shots || []).map((item) => {
-    if (shotKey(item) !== key) return item;
-    return {
-      ...item,
-      references: (item.references || []).map((ref) => {
-        if (ref.asset_id !== assetId && referenceRole(ref) !== role) return ref;
-        return { ...ref, url: registeredUrl, image_url: registeredUrl, public_url: registeredUrl };
-      }),
-    };
-  });
-  return {
-    ...current,
-    final_video_plan: current.final_video_plan ? { ...current.final_video_plan, shots: nextShots } : current.final_video_plan,
-    reference_generation: {
-      ...current.reference_generation,
-      completed: nextCompleted,
-      completed_count: nextCompleted.length,
-      blocked: (current.reference_generation?.blocked || []).filter((manifest) => manifest.shot_id !== key),
-    },
   };
 }
 
@@ -1180,46 +1114,6 @@ export default function Home() {
     }
   }
 
-  async function uploadReferenceFrame(shot: FinalShot, role: ReferenceFrameRole) {
-    const key = shotKey(shot);
-    const manifest = referenceMap[key];
-    const frame = manifest?.[role];
-    const assetId = frame?.asset_id || (role === "entry" ? shot.reference_image_plan?.output_asset_ids?.entry : shot.reference_image_plan?.output_asset_ids?.exit) || "";
-    const imageUrl = frame?.image_url || "";
-    if (!assetId || !imageUrl) {
-      setError(`${key} 缺少${role === "entry" ? "开始" : "结束"}站位图，无法上传。`);
-      return;
-    }
-    if (isHttpUrl(imageUrl)) {
-      setNotice(`${assetId} 已经是 S3/HTTP 图片，无需重复上传。`);
-      return;
-    }
-    resetMessages();
-    setBusy(`upload-reference:${assetId}`);
-    const progressKey = assetId;
-    try {
-      const imageResponse = await fetch(displayImageUrl(imageUrl), { cache: "no-store" });
-      if (!imageResponse.ok) throw new Error(`读取本地站位图失败（HTTP ${imageResponse.status}）`);
-      const blob = await imageResponse.blob();
-      const contentType = blob.type || imageResponse.headers.get("content-type") || "image/png";
-      const file = new File([blob], `${key}_${role}.${imageExtension(contentType)}`, { type: contentType });
-      const data = await uploadImageAssetToS3(assetId, file, progressKey);
-      const registeredUrl = data.public_url || data.image_url || data.url || "";
-      setRouteResult((current) => patchReferenceFrameInRouteResult(current, shot, role, data));
-      await refreshAssetRegistry();
-      setNotice(`${assetId} 已上传到 S3 并回写：${registeredUrl}`);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "上传首尾站位图失败");
-    } finally {
-      setUploadProgress((current) => {
-        const next = { ...current };
-        delete next[progressKey];
-        return next;
-      });
-      setBusy("");
-    }
-  }
-
   function mergeReferenceManifest(manifest: ReferenceManifest) {
     setRouteResult((current) => {
       if (!current) return current;
@@ -1650,7 +1544,10 @@ export default function Home() {
         (total, manifest) => total + Number(Boolean(manifest.entry?.image_url)) + Number(Boolean(manifest.exit?.image_url)),
         0,
       );
-      setNotice(`已加载最近路由与首尾帧：${data.final_video_plan?.shots?.length || 0} 个视频镜头、${imageCount} 张全彩融合图。不会重复调用模型。`);
+      const r2Notice = r2UploadAvailable
+        ? "前端 R2 图片桶已就绪：开始图与结束图都融合本镜头所需的角色、场景和道具图片，可单张生成，也可同时生成。全彩融合 · 非线稿。"
+        : "前端 R2 图片桶尚未就绪：请确认前端 Worker 已加载 GENERATED_IMAGES R2 绑定，然后刷新页面。";
+      setNotice(`已加载最近路由与首尾帧：${data.final_video_plan?.shots?.length || 0} 个视频镜头、${imageCount} 张全彩融合图。不会重复调用模型。${r2Notice}`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "加载最近路由与首尾帧结果失败");
     } finally {
@@ -2303,7 +2200,7 @@ export default function Home() {
         <section className="assetCenterPage submitGenerationPage">
           <section className="card autoFullCard submitGenerationToolbar">
           <div className="cardHead">
-            <div><span>06</span><div><h2>首尾帧融合生图</h2><p>路由时已自动并行生成；这里可查看逐张上传结果，也可手动重生单张或批量补生。</p></div></div>
+            <div><span>06</span><div><h2>视频生成</h2><p>基于首尾帧融合图提交视频生成；可查看逐个分镜，也可手动重生单张或批量补生。</p></div></div>
             <div className="autoInlineActions submitRouteActions">
               <button
                 type="button"
@@ -2344,19 +2241,7 @@ export default function Home() {
               </section>
             )}
           </div>
-          <div className={`r2GenerationNotice ${r2UploadAvailable ? "ready" : "blocked"}`}>
-            <div>
-              <strong>{r2UploadAvailable ? "前端 R2 图片桶已就绪" : "前端 R2 图片桶尚未就绪"}</strong>
-              <span>{r2UploadAvailable ? "开始图与结束图都融合本镜头所需的角色、场景和道具图片，可单张生成，也可同时生成。" : "请确认前端 Worker 已加载 GENERATED_IMAGES R2 绑定，然后刷新页面。"}</span>
-            </div>
-            <b>{r2UploadAvailable ? "全彩融合 · 非线稿" : "生图已锁定"}</b>
-          </div>
-          <div className="submitSummary">
-            <div><small>视频镜头</small><strong>{finalShots.length}</strong></div>
-            <div><small>首尾融合图</small><strong>{generatedReferenceImageCount}/{finalShots.length * 2}</strong></div>
-            <div><small>视频入队</small><strong>{submitResult?.submitted_count || 0}</strong></div>
-            <div><small>阻塞</small><strong>{submitResult?.blocked_count || routeResult?.reference_generation?.blocked_count || 0}</strong></div>
-          </div>
+          </section>
           <div className="submitShotWorkspace">
             <section className="submitShotList submitShotMain">
               {selectedSubmitShot ? (() => {
