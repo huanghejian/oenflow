@@ -1369,8 +1369,8 @@ export default function Home() {
       const data = await readJson<SubmitResponse>(response);
       if (!response.ok) throw new Error(data.detail || "加载最后一次生成视频数据失败");
       setSubmitResult(data);
-      setActiveStep("submit");
-      setNotice(`已加载最后一次视频生成批次：${data.batch_id || "未知批次"}，入队 ${data.submitted_count || 0}，阻塞 ${data.blocked_count || 0}。`);
+      setActiveStep("compose");
+      setNotice(`已加载最后一次视频生成批次：${data.batch_id || "未知批次"}，可合成 ${composableVideoCount(data)} 个，阻塞 ${data.blocked_count || 0}。`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "加载最后一次生成视频数据失败");
     } finally {
