@@ -28,6 +28,7 @@ class Settings:
     xingtu_image_endpoint: str
     xingtu_image_model: str
     xingtu_image_size: str
+    xingtu_image_verify_ssl: bool
     claude_converse_url: str | None
     claude_http_proxy_url: str | None
     claude_region: str | None
@@ -150,6 +151,7 @@ def load_settings() -> Settings:
             "XINGTU_IMAGE_MODEL", "doubao-seedream-5-0-pro-260628"
         ).strip(),
         xingtu_image_size=os.environ.get("XINGTU_IMAGE_SIZE", "2K").strip().upper(),
+        xingtu_image_verify_ssl=_env_bool("XINGTU_IMAGE_VERIFY_SSL", False),
         claude_converse_url=os.environ.get("CLAUDE_CONVERSE_URL"),
         claude_http_proxy_url=(
             os.environ.get("CLAUDE_HTTP_PROXY_URL", "").strip() or None

@@ -42,6 +42,7 @@ def main() -> None:
     ).strip()
     model = os.environ.get("XINGTU_IMAGE_MODEL", "doubao-seedream-5-0-pro-260628").strip()
     size = (args.size or os.environ.get("XINGTU_IMAGE_SIZE", "2K")).strip().upper()
+    verify_ssl = os.environ.get("XINGTU_IMAGE_VERIFY_SSL", "false").strip().lower() in {"1", "true", "yes", "on"}
     if not api_key:
         raise RuntimeError("未配置 XINGTU_IMAGE_API_KEY")
 
@@ -56,7 +57,7 @@ def main() -> None:
     print("POST", endpoint)
     print("请求参数:", json.dumps(payload, ensure_ascii=False))
     started = time.perf_counter()
-    with httpx.Client(timeout=300.0, follow_redirects=True) as client:
+    with httpx.Client(timeout=300.0, follow_redirects=True, verify=verify_ssl, trust_env=False) as client:
         response = client.post(
             endpoint,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},

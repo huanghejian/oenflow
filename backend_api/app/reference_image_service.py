@@ -192,7 +192,12 @@ def _call_xingtu_image(
         prompt, model, aspect_ratio, size, input_references
     )
     try:
-        with httpx.Client(timeout=300.0, follow_redirects=True) as client:
+        with httpx.Client(
+            timeout=300.0,
+            follow_redirects=True,
+            verify=settings.xingtu_image_verify_ssl,
+            trust_env=False,
+        ) as client:
             response = client.post(
                 settings.xingtu_image_endpoint,
                 headers={
