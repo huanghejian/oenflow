@@ -155,12 +155,12 @@ def _xingtu_request_payload(
     payload: dict[str, Any] = {
         "model": model,
         "prompt": f"【图片比例{ratio}】{prompt}",
-        "sequential_image_generation": "disabled",
         "watermark": False,
         "response_format": "url",
         "size": size,
-        "output_format": "jpeg",
     }
+    if "seedream-5" not in model.lower():
+        payload["sequential_image_generation"] = "disabled"
     if input_references:
         payload["image"] = list(input_references)
     return payload
@@ -204,9 +204,9 @@ def _call_xingtu_image(
     input_references: list[str] | None = None,
 ) -> tuple[bytes, str, dict[str, Any]]:
     if not settings.xingtu_image_api_key:
-        raise RuntimeError("未配置 XINGTU_IMAGE_API_KEY，无法执行星图 5.0 Pro 生图")
+        raise RuntimeError("未配置 XINGTU_IMAGE_API_KEY，无法执行星融 3.0 融合生图")
     if size not in {"1K", "2K", "4K"}:
-        raise RuntimeError(f"星图图片尺寸必须是 1K、2K 或 4K，当前为：{size}")
+        raise RuntimeError(f"星融 3.0 图片尺寸必须是 1K、2K 或 4K，当前为：{size}")
     request_payload = _xingtu_request_payload(
         prompt, model, aspect_ratio, size, input_references
     )
@@ -242,18 +242,18 @@ def _call_xingtu_image(
                 )
             if response.status_code >= 400:
                 raise RuntimeError(
-                    f"星图 5.0 Pro 图片生成失败（HTTP {response.status_code}）：{response.text[:500]}"
+                    f"星融 3.0 图片生成失败（HTTP {response.status_code}）：{response.text[:500]}"
                 )
             result = response.json()
             images = result.get("data") or []
             if not images:
-                raise RuntimeError("星图 5.0 Pro 响应中没有 data")
+                raise RuntimeError("星融 3.0 响应中没有 data")
             item = images[0]
             if item.get("url"):
                 image_url = str(item["url"])
                 parsed_url = urlparse(image_url)
                 if parsed_url.scheme not in {"https", "http"} or not parsed_url.netloc:
-                    raise RuntimeError("星图 5.0 Pro 返回了无效图片 URL")
+                    raise RuntimeError("星融 3.0 返回了无效图片 URL")
                 image_response = client.get(image_url, timeout=120.0)
                 image_response.raise_for_status()
                 image_data = image_response.content
@@ -262,11 +262,11 @@ def _call_xingtu_image(
                 image_data = base64.b64decode(item["b64_json"], validate=True)
                 media_type = str(item.get("media_type") or "image/jpeg")
             else:
-                raise RuntimeError("星图 5.0 Pro 的 data[0] 中没有 url 或 b64_json")
+                raise RuntimeError("星融 3.0 的 data[0] 中没有 url 或 b64_json")
     except httpx.HTTPError as exc:
-        raise RuntimeError(f"星图 5.0 Pro 图片服务连接失败：{exc}") from exc
+        raise RuntimeError(f"星融 3.0 图片服务连接失败：{exc}") from exc
     except (ValueError, TypeError) as exc:
-        raise RuntimeError(f"星图 5.0 Pro 返回数据无法解析：{exc}") from exc
+        raise RuntimeError(f"星融 3.0 返回数据无法解析：{exc}") from exc
     return image_data, media_type, result.get("usage") or {}
 
 
@@ -340,12 +340,12 @@ def create_reference_image_pair_xingtu_job(
     job_id = manifest["job_id"]
     model = str(payload.get("image_model") or settings.xingtu_image_model).strip()
     if not model:
-        raise RuntimeError("未配置星图 5.0 Pro 图片模型")
+        raise RuntimeError("未配置星融 3.0 图片模型")
     aspect_ratio = str(payload.get("aspect_ratio") or "9:16").strip() or "9:16"
     size = str(payload.get("image_size") or settings.xingtu_image_size).strip().upper()
 
     if not input_references:
-        raise RuntimeError("星图融合生图至少需要一张已绑定的角色、场景或道具图片")
+        raise RuntimeError("星融 3.0 融合生图至少需要一张已绑定的角色、场景或道具图片")
     entry_prompt = _station_finished_prompt(payload["entry_prompt_zh"], "开始")
     exit_prompt = _station_finished_prompt(payload["exit_prompt_zh"], "结束")
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -372,7 +372,7 @@ def create_reference_image_pair_xingtu_job(
             "aspect_ratio": aspect_ratio,
             "size": size,
             "message": (
-                "星图同时以本镜头绑定的角色、场景和道具图片为参考，"
+                "星融 3.0 同时以本镜头绑定的角色、场景和道具图片为参考，"
                 "并行生成全彩开始图与结束图。"
             ),
             "usage": {"entry": entry_usage, "exit": exit_usage},
@@ -418,7 +418,7 @@ def create_reference_image_frame_xingtu_job(
 
     model = str(payload.get("image_model") or settings.xingtu_image_model).strip()
     if not model:
-        raise RuntimeError("未配置星图 5.0 Pro 图片模型")
+        raise RuntimeError("未配置星融 3.0 图片模型")
     aspect_ratio = str(payload.get("aspect_ratio") or "9:16").strip() or "9:16"
     size = str(payload.get("image_size") or settings.xingtu_image_size).strip().upper()
     prompt_key = "entry_prompt_zh" if role == "entry" else "exit_prompt_zh"

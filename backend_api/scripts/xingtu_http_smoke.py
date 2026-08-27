@@ -26,7 +26,7 @@ def load_local_env(path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="星图 5.0 Pro 直接 HTTP 文生图测试")
+    parser = argparse.ArgumentParser(description="星融 3.0 直接 HTTP 融合生图测试")
     parser.add_argument("prompt")
     parser.add_argument("--output", required=True)
     parser.add_argument("--ratio", default="9:16")
@@ -40,7 +40,7 @@ def main() -> None:
         "XINGTU_IMAGE_ENDPOINT",
         "https://ark.cn-beijing.volces.com/api/v3/images/generations",
     ).strip()
-    model = os.environ.get("XINGTU_IMAGE_MODEL", "doubao-seedream-5-0-pro-260628").strip()
+    model = os.environ.get("XINGTU_IMAGE_MODEL", "doubao-seedream-4-5-251128").strip()
     size = (args.size or os.environ.get("XINGTU_IMAGE_SIZE", "2K")).strip().upper()
     verify_ssl = os.environ.get("XINGTU_IMAGE_VERIFY_SSL", "false").strip().lower() in {"1", "true", "yes", "on"}
     if not api_key:
@@ -52,7 +52,6 @@ def main() -> None:
         "watermark": False,
         "response_format": "url",
         "size": size,
-        "output_format": "jpeg",
     }
     print("POST", endpoint)
     print("请求参数:", json.dumps(payload, ensure_ascii=False))

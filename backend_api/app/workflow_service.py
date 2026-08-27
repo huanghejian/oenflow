@@ -276,6 +276,7 @@ def register_reference_pair(manifest: dict[str, Any]) -> dict[str, Any]:
     job_id = str(manifest.get("job_id") or "").strip()
     if job_id:
         manifest_path = settings.work_root / "reference_images" / job_id / "manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
         temp = manifest_path.with_suffix(".json.tmp")
         temp.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -304,10 +305,16 @@ def asset_reference_data_urls(asset_ids: list[str]) -> list[str]:
         binding = registry.get(asset_id)
         if not binding:
             raise ValueError(f"图片资产尚未绑定：{asset_id}")
-        url = str(binding.get("local_url") or binding.get("url") or "")
-        if urllib.parse.urlsplit(url).scheme in {"http", "https"}:
-            references.append(url)
+        remote_url = str(
+            binding.get("public_url")
+            or binding.get("image_url")
+            or binding.get("url")
+            or ""
+        )
+        if urllib.parse.urlsplit(remote_url).scheme in {"http", "https"}:
+            references.append(remote_url)
             continue
+        url = str(binding.get("local_url") or binding.get("url") or "")
         root = next((value for prefix, value in roots.items() if url.startswith(prefix)), None)
         prefix = next((value for value in roots if url.startswith(value)), None)
         if root is None or prefix is None:
@@ -322,12 +329,24 @@ def asset_reference_data_urls(asset_ids: list[str]) -> list[str]:
     return references
 
 
-def auto_bind_video_plan(final_video_plan: dict[str, Any]) -> dict[str, Any]:
+def auto_bind_video_plan(
+    final_video_plan: dict[str, Any],
+    *,
+    include_reference_frames: bool = True,
+    rewrite_prompt: bool = True,
+) -> dict[str, Any]:
     with _registry_lock:
         registry = _load_registry_unlocked()
-    result = bind_logical_assets(final_video_plan, registry)
+    result = bind_logical_assets(
+        final_video_plan,
+        registry,
+        include_reference_frames=include_reference_frames,
+        rewrite_prompt=rewrite_prompt,
+    )
     result["registry_count"] = len(registry)
     result["binding_mode"] = "local_demo_registry"
+    result["include_reference_frames"] = include_reference_frames
+    result["rewrite_prompt"] = rewrite_prompt
     return result
 
 

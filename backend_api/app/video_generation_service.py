@@ -218,6 +218,8 @@ def _submit_one(job: dict[str, Any]) -> dict[str, Any]:
                 "ratio": payload.ratio,
                 "resolution": payload.resolution,
                 "resolution_preset": payload.resolution_preset,
+                "include_reference_frames": settings.video_submit_include_reference_frames,
+                "rewrite_prompt": settings.video_submit_rewrite_prompt,
                 "prompt": payload.prompt,
                 "image_references": [
                     {
@@ -259,7 +261,11 @@ def submit_video_batch(
     regenerate_existing: bool = False,
 ) -> dict[str, Any]:
     params = project_params or {}
-    binding = auto_bind_video_plan(final_video_plan)
+    binding = auto_bind_video_plan(
+        final_video_plan,
+        include_reference_frames=settings.video_submit_include_reference_frames,
+        rewrite_prompt=settings.video_submit_rewrite_prompt,
+    )
     plan_signature = _video_plan_batch_signature(final_video_plan)
     latest_batch = load_latest_batch()
     latest_signature = str((latest_batch or {}).get("plan_signature") or "")
@@ -282,7 +288,7 @@ def submit_video_batch(
         references = provider_payload.get("references") or []
         slot_key = _video_job_slot_key(ready.get("shot_id"))
         existing_job = existing_by_slot.get(slot_key)
-        if existing_job and existing_job.get("status") in ACTIVE_STATUSES:
+        if existing_job and existing_job.get("status") in ACTIVE_STATUSES and existing_job.get("status") != "pending":
             jobs.append(existing_job)
             continue
         if existing_job and not regenerate_existing and _job_has_video_result(existing_job):
@@ -348,6 +354,8 @@ def submit_video_batch(
             "job_ids": _merge_job_ids(existing_job_ids, jobs),
             "created_at": (latest_batch or {}).get("created_at") or utc_now(),
             "registry_count": binding.get("registry_count", 0),
+            "include_reference_frames": binding.get("include_reference_frames"),
+            "rewrite_prompt": binding.get("rewrite_prompt"),
             "plan_signature": plan_signature,
             "plan_shot_count": len(final_video_plan.get("batch_shots") or final_video_plan.get("shots") or []),
         }

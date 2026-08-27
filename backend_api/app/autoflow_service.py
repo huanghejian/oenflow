@@ -3423,7 +3423,7 @@ def generate_latest_reference_frame(
     image_model: str | None,
 ) -> dict[str, Any]:
     if generation_mode != "xingtu":
-        raise ValueError("当前手动首尾帧仅支持星图融合生图")
+        raise ValueError("当前手动首尾帧仅支持星融 3.0 融合生图")
     result = load_latest_route_result()
     final_video_plan = result.get("final_video_plan") or {}
     shot = next(
@@ -3507,7 +3507,7 @@ def generate_reference_frame_from_group(
 ) -> dict[str, Any]:
     """Generate one frame from pre-route data so routing can run concurrently."""
     if generation_mode != "xingtu":
-        raise ValueError("并行融合生图仅支持星图图片模型")
+        raise ValueError("并行融合生图仅支持星融 3.0 图片模型")
     if role not in {"entry", "exit"}:
         raise ValueError(f"不支持的图片角色：{role}")
     shot = _prepare_unrouted_reference_shot(
@@ -3604,15 +3604,27 @@ def publish_latest_reference_frame(
             )
         if not frame.get("local_image_url"):
             raise ValueError("本地融合图路径缺失，无法登记 R2 上传结果")
+        from .s3_asset_service import publish_image_asset
+
+        s3_published = publish_image_asset(str(frame.get("local_image_url") or image_url))
+        s3_url = str(s3_published.get("public_url") or s3_published["url"])
         frame.update(
             {
                 "status": "completed",
-                "image_url": image_url,
+                "image_url": s3_url,
+                "public_url": s3_url,
+                "s3_key": s3_published.get("s3_key"),
+                "r2_url": image_url,
+                "r2_key": r2_key,
                 "storage": {
                     "status": "uploaded",
-                    "provider": "cloudflare-r2",
-                    "key": r2_key,
-                    "url": image_url,
+                    "provider": "s3",
+                    "key": s3_published.get("s3_key"),
+                    "url": s3_url,
+                    "frontend_r2": {
+                        "key": r2_key,
+                        "url": image_url,
+                    },
                 },
             }
         )
@@ -3622,15 +3634,94 @@ def publish_latest_reference_frame(
         )
         manifest["status"] = "completed" if pair_uploaded else "waiting_manual"
         manifest["message"] = (
-            "首尾融合图均已上传前端 R2。"
+            "首尾融合图均已发布到 S3。"
             if pair_uploaded
-            else "当前融合图已上传前端 R2；可继续生成另一张。"
+            else "当前融合图已发布到 S3；可继续生成另一张。"
         )
         manifest["registry"] = register_reference_pair(manifest)
         _replace_latest_reference_manifest(result, manifest)
         _save_step_result(AUTOFLOW_ROUTE_RESULT_PATH, result, "autoflow.reference.frame.published")
     log_payload(logger, "autoflow.reference.frame.published", manifest)
     return manifest
+
+
+def _reference_frame_needs_s3(frame: dict[str, Any]) -> bool:
+    storage = frame.get("storage") if isinstance(frame.get("storage"), dict) else {}
+    provider = str(storage.get("provider") or "").lower()
+    image_url = str(frame.get("image_url") or "")
+    return bool(frame.get("local_image_url")) and (
+        not frame.get("s3_key")
+        or provider in {"r2", "cloudflare-r2"}
+        or image_url.startswith("/workflow-generated/")
+        or "127.0.0.1" in image_url
+        or "localhost" in image_url
+    )
+
+
+def _rewrite_reference_frame_to_s3(frame: dict[str, Any]) -> bool:
+    if not _reference_frame_needs_s3(frame):
+        return False
+    from .s3_asset_service import publish_image_asset
+
+    old_storage = frame.get("storage") if isinstance(frame.get("storage"), dict) else {}
+    old_url = str(frame.get("image_url") or "")
+    old_key = str(frame.get("r2_key") or old_storage.get("key") or "")
+    published = publish_image_asset(str(frame.get("local_image_url")))
+    s3_url = str(published.get("public_url") or published["url"])
+    frame.update(
+        {
+            "status": "completed",
+            "image_url": s3_url,
+            "public_url": s3_url,
+            "s3_key": published.get("s3_key"),
+            "storage": {
+                "status": "uploaded",
+                "provider": "s3",
+                "key": published.get("s3_key"),
+                "url": s3_url,
+                **(
+                    {
+                        "frontend_r2": {
+                            "key": old_key,
+                            "url": old_url,
+                        }
+                    }
+                    if old_url
+                    else {}
+                ),
+            },
+        }
+    )
+    return True
+
+
+def _ensure_reference_frames_use_s3(result: dict[str, Any]) -> bool:
+    generation = result.get("reference_generation") or {}
+    changed = False
+    for bucket in ("completed", "blocked"):
+        for manifest in generation.get(bucket) or []:
+            if not isinstance(manifest, dict):
+                continue
+            manifest_changed = False
+            for role in ("entry", "exit"):
+                frame = manifest.get(role)
+                if not isinstance(frame, dict):
+                    continue
+                try:
+                    if _rewrite_reference_frame_to_s3(frame):
+                        manifest_changed = True
+                except Exception as exc:
+                    logger.warning(
+                        "reference frame s3 normalize failed shot_id=%s role=%s error=%s",
+                        manifest.get("shot_id"),
+                        role,
+                        exc,
+                    )
+            if manifest_changed:
+                manifest["message"] = "首尾融合图已保存为 S3 地址。"
+                manifest["registry"] = register_reference_pair(manifest)
+                changed = True
+    return changed
 
 
 def load_latest_route_result() -> dict[str, Any]:
@@ -3655,6 +3746,12 @@ def load_latest_route_result() -> dict[str, Any]:
         reference_generation.get("blocked", []), list
     ):
         raise RuntimeError("保存的路由与首尾帧结果结构无效。")
+    if _ensure_reference_frames_use_s3(result):
+        _save_step_result(
+            AUTOFLOW_ROUTE_RESULT_PATH,
+            result,
+            "autoflow.reference.frames.s3_normalized",
+        )
     log_event(logger, "autoflow.routing.latest.loaded", path=str(AUTOFLOW_ROUTE_RESULT_PATH))
     return result
 

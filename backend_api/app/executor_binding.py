@@ -288,6 +288,8 @@ def _prepare_provider_prompt_and_references(
     shot: dict[str, Any],
     bound_references: list[dict[str, Any]],
     asset_names: dict[str, str],
+    *,
+    rewrite_prompt: bool = True,
 ) -> tuple[str, list[dict[str, Any]]]:
     ordered = _ordered_references(bound_references)
     image_index = 0
@@ -300,12 +302,17 @@ def _prepare_provider_prompt_and_references(
             item["picture_index"] = image_index
             item["picture_label"] = f"图片{image_index}"
         prepared.append(item)
-    prompt = _video_prompt(str(shot.get("prompt_zh") or ""), _image_references(prepared))
+    source_prompt = str(shot.get("prompt_zh") or "")
+    prompt = _video_prompt(source_prompt, _image_references(prepared)) if rewrite_prompt else source_prompt
     return prompt, prepared
 
 
 def bind_logical_assets(
-    final_video_plan: dict[str, Any], asset_registry: dict[str, dict[str, Any]]
+    final_video_plan: dict[str, Any],
+    asset_registry: dict[str, dict[str, Any]],
+    *,
+    include_reference_frames: bool = True,
+    rewrite_prompt: bool = True,
 ) -> dict[str, Any]:
     ready: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
@@ -318,6 +325,8 @@ def bind_logical_assets(
         prompt_zh = str(shot.get("prompt_zh") or "")
         for ref in shot.get("references", []):
             asset_id = str(ref.get("asset_id") or "")
+            if ref.get("derived") and not include_reference_frames:
+                continue
             if not ref.get("derived") and not _prompt_uses_asset(prompt_zh, asset_id):
                 continue
             binding = _find_binding(shot, ref, asset_registry, asset_names, asset_records)
@@ -358,7 +367,10 @@ def bind_logical_assets(
             continue
 
         prompt, ordered_references = _prepare_provider_prompt_and_references(
-            shot, bound_references, asset_names
+            shot,
+            bound_references,
+            asset_names,
+            rewrite_prompt=rewrite_prompt,
         )
         provider_payload = {
             "shot_id": shot.get("shot_id"),

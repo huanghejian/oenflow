@@ -50,7 +50,7 @@ def main() -> None:
         try:
             autoflow_service._save_step_result(test_path, source, "test.route.saved")
             result = autoflow_service.regenerate_latest_reference_images(
-                "xingtu", "doubao-seedream-5-0-pro-260628"
+                "xingtu", "doubao-seedream-4-5-251128"
             )
         finally:
             autoflow_service.AUTOFLOW_ROUTE_RESULT_PATH = original_path

@@ -4,6 +4,9 @@ from app import autoflow_service
 from app import reference_image_service as service
 
 
+XINGRONG_MODEL = "doubao-seedream-4-5-251128"
+
+
 class _FakeResponse:
     def __init__(self, *, body: dict | None = None, content: bytes = b"", media_type: str = "application/json", status_code: int = 200, text: str = "ok") -> None:
         self.status_code = status_code
@@ -53,18 +56,17 @@ class _FakeClient:
 def main() -> None:
     payload = service._xingtu_request_payload(
         "国漫少年剑客",
-        "doubao-seedream-5-0-pro-260628",
+        XINGRONG_MODEL,
         "9:16",
         "2K",
     )
     assert payload == {
-        "model": "doubao-seedream-5-0-pro-260628",
+        "model": XINGRONG_MODEL,
         "prompt": "【图片比例9:16】国漫少年剑客",
         "sequential_image_generation": "disabled",
         "watermark": False,
         "response_format": "url",
         "size": "2K",
-        "output_format": "jpeg",
     }
 
     original_client = service.httpx.Client
@@ -74,7 +76,7 @@ def main() -> None:
         object.__setattr__(service.settings, "xingtu_image_api_key", "test-key")
         data, media_type, usage = service._call_xingtu_image(
             "国漫少年剑客",
-            "doubao-seedream-5-0-pro-260628",
+            XINGRONG_MODEL,
             "9:16",
             "2K",
         )
@@ -94,7 +96,7 @@ def main() -> None:
         object.__setattr__(service.settings, "xingtu_image_api_key", "test-key")
         service._call_xingtu_image(
             "国漫少年剑客",
-            "doubao-seedream-5-0-pro-260628",
+            XINGRONG_MODEL,
             "9:16",
             "2K",
         )
@@ -184,7 +186,7 @@ def main() -> None:
                 },
             },
             "xingtu",
-            "doubao-seedream-5-0-pro-260628",
+            XINGRONG_MODEL,
             "9:16",
         )
     finally:

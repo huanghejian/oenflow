@@ -44,17 +44,17 @@ function frameState(
 ): { key: string; label: string; hint: string } {
   const frame = manifest?.[role];
   if (uploadPercent !== undefined) {
-    return { key: "uploading", label: `上传 ${uploadPercent}%`, hint: "正在上传到前端 R2" };
+    return { key: "uploading", label: `上传 ${uploadPercent}%`, hint: "正在发布并保存 S3 地址" };
   }
   if (isGenerating) {
     return frame?.image_url
       ? { key: "generating", label: "重新生成中", hint: "旧图保留，正在等待新图返回" }
-      : { key: "generating", label: "正在生成", hint: "星图同步请求处理中" };
+      : { key: "generating", label: "正在生成", hint: "星融 3.0 同步请求处理中" };
   }
   if (frame?.image_url) {
     return isRemoteImage(frame.image_url)
-      ? { key: "uploaded", label: "已上传", hint: "前端 R2 图片已绑定到当前镜头" }
-      : { key: "completed", label: "已生成", hint: "正在等待浏览器上传前端 R2" };
+      ? { key: "uploaded", label: "已上传", hint: "S3 图片已绑定到当前镜头" }
+      : { key: "completed", label: "已生成", hint: "正在等待发布 S3 地址" };
   }
   if (["blocked", "failed", "error"].includes(String(manifest?.status || "").toLowerCase())) {
     return { key: "failed", label: "生成失败", hint: "请查看本步骤的阻塞原因后重试" };
@@ -132,7 +132,7 @@ export default function ReferenceFrameSlots({
               <figcaption>
                 <div>
                   <strong>{title}</strong>
-                  <small>{frame?.storage?.status === "uploaded" ? "已上传前端 R2" : frame?.asset_id || fallbackId || `${shotId || "shot"}_${role}`}</small>
+                  <small>{frame?.storage?.status === "uploaded" ? "已保存 S3 地址" : frame?.asset_id || fallbackId || `${shotId || "shot"}_${role}`}</small>
                 </div>
                 {onGenerate ? (
                   <button type="button" className="frameGenerateButton" onClick={() => onGenerate(role)} disabled={!canGenerateRole}>

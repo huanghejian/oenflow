@@ -71,6 +71,8 @@ class Settings:
     video_max_concurrency: int
     video_asset_process_wait_seconds: int
     video_asset_process_retry: int
+    video_submit_include_reference_frames: bool
+    video_submit_rewrite_prompt: bool
 
 
 def _load_env_file(path: Path) -> None:
@@ -148,7 +150,7 @@ def load_settings() -> Settings:
             "https://ark.cn-beijing.volces.com/api/v3/images/generations",
         ).strip(),
         xingtu_image_model=os.environ.get(
-            "XINGTU_IMAGE_MODEL", "doubao-seedream-5-0-pro-260628"
+            "XINGTU_IMAGE_MODEL", "doubao-seedream-4-5-251128"
         ).strip(),
         xingtu_image_size=os.environ.get("XINGTU_IMAGE_SIZE", "2K").strip().upper(),
         xingtu_image_verify_ssl=_env_bool("XINGTU_IMAGE_VERIFY_SSL", False),
@@ -248,6 +250,10 @@ def load_settings() -> Settings:
         video_asset_process_retry=int(
             os.environ.get("VIDEO_ASSET_PROCESS_RETRY", "5")
         ),
+        video_submit_include_reference_frames=_env_bool(
+            "VIDEO_SUBMIT_INCLUDE_REFERENCE_FRAMES", True
+        ),
+        video_submit_rewrite_prompt=_env_bool("VIDEO_SUBMIT_REWRITE_PROMPT", True),
     )
 
 

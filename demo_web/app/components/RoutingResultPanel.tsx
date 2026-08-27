@@ -182,7 +182,7 @@ export default function RoutingResultPanel({ routingShots, finalShots, reference
             <div className="referenceGenerationMeta">
               <strong>镜头组站位参考图</strong>
               <span>
-                {manifest?.provider === "volcengine_ark" ? "星图 5.0 Pro" : manifest?.provider || (manifest?.demo_placeholder ? "Demo 占位" : "等待生成")}
+                {manifest?.provider === "volcengine_ark" ? "星融 3.0" : manifest?.provider || (manifest?.demo_placeholder ? "Demo 占位" : "等待生成")}
                 {manifest?.size ? ` · ${manifest.size}` : ""}
                 {` · ${manifest?.aspect_ratio || "9:16"}`}
               </span>

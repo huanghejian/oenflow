@@ -73,6 +73,8 @@ const FLOW_STEPS: Array<{ id: FlowStep; index: string; title: string; caption: s
   { id: "finale", index: "08", title: "终章", caption: "查看完整成片" },
 ];
 
+const XINGRONG_IMAGE_MODEL = "doubao-seedream-4-5-251128";
+
 const EMPTY_ASSETS: AutoFlowAssets = { characters: [], scenes: [], items: [] };
 const DEFAULT_STORYBOARD_PROMPT = `以 Seedance 2.0 分镜导演 Agent 指令系统为基础，只完成分镜结构组织与子镜头规划。
 必须基于上一步资产清单引用角色、场景、关键道具，不要新增未识别的核心资产。
@@ -524,7 +526,7 @@ export default function Home() {
   const [routingDetailShotId, setRoutingDetailShotId] = useState<string | null>(null);
   const [submitDetailShotId, setSubmitDetailShotId] = useState("");
   const [generationMode, setGenerationMode] = useState<GenerationMode>("xingtu");
-  const [imageModel, setImageModel] = useState("doubao-seedream-5-0-pro-260628");
+  const [imageModel, setImageModel] = useState(XINGRONG_IMAGE_MODEL);
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -717,7 +719,7 @@ export default function Home() {
 
   function selectImageGenerationMode(mode: GenerationMode) {
     setGenerationMode(mode);
-    if (mode === "xingtu") setImageModel("doubao-seedream-5-0-pro-260628");
+    if (mode === "xingtu") setImageModel(XINGRONG_IMAGE_MODEL);
     if (mode === "openrouter") setImageModel("openai/gpt-image-2");
   }
 
@@ -1253,7 +1255,7 @@ export default function Home() {
     try {
       await generateAndPublishReferenceFrame(shotId, role);
       await refreshAssetRegistry();
-      setNotice(`${shotId} ${role === "entry" ? "开始" : "结束"}融合图已生成并上传前端 R2。`);
+      setNotice(`${shotId} ${role === "entry" ? "开始" : "结束"}融合图已生成并保存 S3 地址。`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "融合首尾帧生成失败");
     } finally {
@@ -1322,7 +1324,7 @@ export default function Home() {
         const detail = failed.map((result) => result.status === "rejected" && result.reason instanceof Error ? result.reason.message : "生成失败").join("；");
         throw new Error(`${shotId} 已完成 ${2 - failed.length}/2 张：${detail}`);
       }
-      setNotice(`${shotId} 首尾两张融合图已同时生成，并分别上传前端 R2。`);
+      setNotice(`${shotId} 首尾两张融合图已同时生成，并保存 S3 地址。`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "同时生成首尾融合图失败");
     } finally {
@@ -1450,7 +1452,7 @@ export default function Home() {
     if (!analysisResult) return;
     const selectedGenerationMode = modeOverride || generationMode;
     const selectedImageModel = selectedGenerationMode === "xingtu"
-      ? "doubao-seedream-5-0-pro-260628"
+      ? XINGRONG_IMAGE_MODEL
       : imageModel;
     resetMessages();
     setBusy("routing-parallel");
@@ -2124,14 +2126,14 @@ export default function Home() {
               <div className="routingTemplateOptions">
                 <select value={generationMode} onChange={(event) => selectImageGenerationMode(event.target.value as GenerationMode)}>
                   <option value="demo">Demo 占位图</option>
-                  <option value="xingtu">星图 5.0 Pro 融合生图（真实）</option>
+                  <option value="xingtu">星融 3.0 融合生图（真实）</option>
                 </select>
                 <input value={imageModel} onChange={(event) => setImageModel(event.target.value)} disabled={generationMode === "demo"} />
                 <span className={`imageProviderState ${generationMode !== "demo" && ((generationMode === "xingtu" && xingtuImageAvailable) || (generationMode === "openrouter" && openrouterImageAvailable)) ? "ready" : ""}`}>
                   {generationMode === "demo"
                     ? "占位图 · 9:16"
                     : generationMode === "xingtu"
-                      ? `${xingtuImageAvailable ? "图片模型已配置" : "图片模型未配置"} · ${r2UploadAvailable ? "前端 R2 已就绪" : "前端 R2 未就绪"} · 路由与融合生图并行 · 2K · 9:16`
+                      ? `${xingtuImageAvailable ? "星融 3.0 已配置" : "星融 3.0 未配置"} · ${r2UploadAvailable ? "前端 R2 已就绪" : "前端 R2 未就绪"} · 路由与融合生图并行 · 2K · 9:16`
                       : `${openrouterImageAvailable ? "已配置" : "密钥未配置"} · 9:16`}
                 </span>
                 <button
