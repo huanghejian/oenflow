@@ -64,16 +64,23 @@ def _proxy_client(proxy_url: str) -> httpx.Client:
         return client
 
 
-def _post_with_connection_retry(
+def _request_with_connection_retry(
+    method: str,
     url: str,
-    content: bytes,
+    content: bytes | None,
     headers: dict[str, str],
     client: Any | None = None,
 ) -> httpx.Response:
     request_client = client or _client
     for attempt in range(2):
         try:
-            return request_client.post(url, content=content, headers=headers)
+            if hasattr(request_client, "request"):
+                return request_client.request(
+                    method, url, content=content, headers=headers
+                )
+            if method.upper() == "POST":
+                return request_client.post(url, content=content, headers=headers)
+            return request_client.get(url, headers=headers)
         except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
             message = str(exc).lower()
             disconnected_before_response = (
@@ -88,6 +95,16 @@ def _post_with_connection_retry(
     raise RuntimeError("LongTimeHttp connection retry exhausted")
 
 
+def _post_with_connection_retry(
+    url: str,
+    content: bytes,
+    headers: dict[str, str],
+    client: Any | None = None,
+) -> httpx.Response:
+    """兼容既有调用；新代码统一使用通用 request 重试函数。"""
+    return _request_with_connection_retry("POST", url, content, headers, client)
+
+
 def post_json(
     url: str,
     payload: dict[str, Any],
@@ -96,6 +113,8 @@ def post_json(
     proxy_url: str | None = None,
     force_direct: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
+    if not str(url or "").strip() or str(url).strip().upper().startswith("XXX"):
+        raise RuntimeError("视频模型提交 endpoint 尚未配置")
     request_headers = dict(headers or {})
     request_headers.setdefault("Authorization", token)
     request_headers.setdefault("Content-Type", "application/json")
@@ -114,7 +133,8 @@ def post_json(
     )
 
     try:
-        response = _post_with_connection_retry(
+        response = _request_with_connection_retry(
+            "POST",
             url,
             json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             request_headers,
@@ -167,3 +187,73 @@ def post_json(
         },
     )
     return data, response.headers.get("x-request-id")
+
+
+def get_json(
+    url: str,
+    token: str,
+    headers: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], str | None]:
+    request_headers = dict(headers or {})
+    request_headers.setdefault("Authorization", token)
+    request_headers.setdefault("Accept", "application/json")
+    started_at = time.perf_counter()
+    log_payload(
+        logger,
+        "http.get_json.request",
+        {"url": url, "headers": request_headers},
+    )
+    try:
+        response = _request_with_connection_retry(
+            "GET", url, None, request_headers
+        )
+    except httpx.TimeoutException as exc:
+        logger.exception("http.get_json.timeout url=%s", url)
+        raise RuntimeError(
+            f"LongTimeHttp 等待超时（connect={CONNECT_TIMEOUT_SECONDS}s, "
+            f"read={READ_TIMEOUT_SECONDS}s, write={WRITE_TIMEOUT_SECONDS}s）"
+        ) from exc
+    except httpx.TransportError as exc:
+        logger.exception("http.get_json.transport_error url=%s", url)
+        raise RuntimeError(f"LongTimeHttp 连接失败: {exc}") from exc
+
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    if not response.is_success:
+        raise LongTimeHttpError(response.status_code, response.text[:2000])
+    body_text = (response.text or "").strip()
+    if not body_text:
+        raise LongTimeHttpError(response.status_code, "empty response")
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise LongTimeHttpError(response.status_code, body_text[:2000]) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("LongTimeHttp 响应顶层必须是 JSON 对象")
+    log_payload(
+        logger,
+        "http.get_json.response",
+        {
+            "url": url,
+            "status_code": response.status_code,
+            "elapsed_ms": elapsed_ms,
+            "response_id": response.headers.get("x-request-id"),
+            "body": data,
+        },
+    )
+    return data, response.headers.get("x-request-id")
+
+
+def bearer(api_key: str | None) -> str:
+    key = str(api_key or "").strip()
+    if not key or key.upper() == "XXX":
+        raise RuntimeError("视频模型 API Key 尚未配置")
+    return f"Bearer {key}"
+
+
+def join_task_url(base_url: str, task_id: str) -> str:
+    base = str(base_url or "").strip()
+    if not base or base.upper().startswith("XXX"):
+        raise RuntimeError("视频模型查询 endpoint 尚未配置")
+    if "{taskId}" in base:
+        return base.replace("{taskId}", task_id)
+    return f"{base.rstrip('/')}/{task_id}"

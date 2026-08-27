@@ -91,16 +91,91 @@ def save_uploaded_asset(
     file_id = uuid.uuid4().hex
     target = WORKFLOW_UPLOAD_ROOT / f"{file_id}{extension}"
     target.write_bytes(data)
+    from .s3_asset_service import upload_bytes
+
+    published = upload_bytes(
+        data,
+        suffix=extension,
+        content_type=normalized_mime,
+        name_hint=original_filename or f"{asset_id}{extension}",
+    )
     return register_binding(
         asset_id,
         {
-            "file_id": f"local-upload::{file_id}",
-            "url": f"/workflow-assets/{target.name}",
+            "file_id": f"s3::{published['s3_key']}",
+            "url": published["url"],
+            "image_url": published["url"],
+            "public_url": published["url"],
+            "s3_key": published["s3_key"],
+            "local_url": f"/workflow-assets/{target.name}",
             "media_type": "image",
             "mime_type": normalized_mime,
             "size_bytes": len(data),
             "original_filename": original_filename or "uploaded-image",
-            "source": "user_upload",
+            "source": "user_upload_s3",
+        },
+    )
+
+
+def create_asset_upload_token(
+    asset_id: str,
+    *,
+    content_type: str,
+    size_bytes: int,
+    original_filename: str | None = None,
+) -> dict[str, Any]:
+    if size_bytes <= 0:
+        raise ValueError("上传图片为空")
+    if size_bytes > MAX_IMAGE_BYTES:
+        raise ValueError("单张图片不得超过 15MB")
+    from .s3_asset_service import create_presigned_image_upload
+
+    return create_presigned_image_upload(
+        asset_id=asset_id,
+        content_type=content_type,
+        size_bytes=size_bytes,
+        original_filename=original_filename,
+    )
+
+
+def register_s3_uploaded_asset(
+    asset_id: str,
+    *,
+    s3_key: str,
+    url: str | None = None,
+    content_type: str | None = None,
+    size_bytes: int | None = None,
+    original_filename: str | None = None,
+) -> dict[str, Any]:
+    from .s3_asset_service import (
+        normalize_image_content_type,
+        object_http_url,
+        validate_upload_object_key,
+    )
+
+    key = validate_upload_object_key(s3_key)
+    actual_size = int(size_bytes or 0)
+    if actual_size <= 0:
+        raise ValueError("S3 图片对象为空")
+    if actual_size > MAX_IMAGE_BYTES:
+        raise ValueError("单张图片不得超过 15MB")
+    normalized_mime, _ = normalize_image_content_type(content_type)
+    public_url = object_http_url(key)
+    if url and urllib.parse.urlsplit(url).scheme in {"http", "https"}:
+        public_url = url
+    return register_binding(
+        asset_id,
+        {
+            "file_id": f"s3::{key}",
+            "url": public_url,
+            "image_url": public_url,
+            "public_url": public_url,
+            "s3_key": key,
+            "media_type": "image",
+            "mime_type": normalized_mime,
+            "size_bytes": actual_size,
+            "original_filename": original_filename or "uploaded-image",
+            "source": "user_upload_s3_direct",
         },
     )
 
@@ -128,6 +203,8 @@ def seed_demo_assets() -> dict[str, Any]:
 
 
 def register_reference_pair(manifest: dict[str, Any]) -> dict[str, Any]:
+    from .s3_asset_service import publish_image_asset
+
     registered = []
     for key in ("entry", "exit"):
         item = manifest.get(key) or {}
@@ -135,21 +212,56 @@ def register_reference_pair(manifest: dict[str, Any]) -> dict[str, Any]:
         image_url = item.get("image_url")
         if not asset_id or not image_url:
             continue
+        published = (
+            {
+                "url": str(image_url),
+                "public_url": str(item.get("public_url") or image_url),
+                "s3_key": str(item["s3_key"]),
+                **(
+                    {"local_url": str(item["local_url"])}
+                    if item.get("local_url")
+                    else {}
+                ),
+            }
+            if item.get("s3_key")
+            else publish_image_asset(str(image_url))
+        )
+        item.update(published)
+        item["image_url"] = published["url"]
         registered.append(
             register_binding(
                 str(asset_id),
                 {
-                    "file_id": f"reference-image::{manifest.get('job_id')}::{key}",
-                    "url": image_url,
+                    "file_id": (
+                        f"s3::{published['s3_key']}"
+                        if published.get("s3_key")
+                        else f"reference-image::{manifest.get('job_id')}::{key}"
+                    ),
+                    "url": published["url"],
+                    "image_url": published["url"],
+                    "public_url": published["url"],
+                    "local_url": published.get("local_url"),
+                    "s3_key": published.get("s3_key"),
                     "media_type": "image",
-                    "mime_type": "image/png",
-                    "source": "derived_reference_image",
+                    "mime_type": item.get("mime_type") or "image/png",
+                    "source": "derived_reference_image_s3",
                     "shot_id": manifest.get("shot_id"),
                     "generated_role": key,
                     "ordinary_image_reference": True,
                 },
             )
         )
+    entry_url = (manifest.get("entry") or {}).get("image_url")
+    if entry_url and isinstance(manifest.get("exit"), dict):
+        manifest["exit"]["source_image_url"] = entry_url
+    job_id = str(manifest.get("job_id") or "").strip()
+    if job_id:
+        manifest_path = settings.work_root / "reference_images" / job_id / "manifest.json"
+        temp = manifest_path.with_suffix(".json.tmp")
+        temp.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temp.replace(manifest_path)
     return {"registered_count": len(registered), "assets": registered}
 
 
@@ -172,7 +284,7 @@ def asset_reference_data_urls(asset_ids: list[str]) -> list[str]:
         binding = registry.get(asset_id)
         if not binding:
             raise ValueError(f"图片资产尚未绑定：{asset_id}")
-        url = str(binding.get("url") or "")
+        url = str(binding.get("local_url") or binding.get("url") or "")
         root = next((value for prefix, value in roots.items() if url.startswith(prefix)), None)
         prefix = next((value for value in roots if url.startswith(value)), None)
         if root is None or prefix is None:
@@ -197,36 +309,9 @@ def auto_bind_video_plan(final_video_plan: dict[str, Any]) -> dict[str, Any]:
 
 
 def submit_video_jobs(final_video_plan: dict[str, Any]) -> dict[str, Any]:
-    binding = auto_bind_video_plan(final_video_plan)
-    jobs: list[dict[str, Any]] = []
-    for ready in binding.get("ready", []):
-        job_id = uuid.uuid4().hex
-        provider_payload = ready.get("provider_payload") or {}
-        references = provider_payload.get("references") or []
-        manifest = {
-            "job_id": job_id,
-            "shot_id": ready.get("shot_id"),
-            "status": "queued_demo",
-            "mode": "local_video_provider_simulation",
-            "message": "已完成资产和开始/结束站位图绑定；Demo 仅模拟送往视频生成器。",
-            "provider_payload": provider_payload,
-            "bound_asset_ids": [ref.get("asset_id") for ref in references],
-            "derived_reference_ids": [
-                ref.get("asset_id") for ref in references if ref.get("derived")
-            ],
-        }
-        (WORKFLOW_VIDEO_JOB_ROOT / f"{job_id}.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        jobs.append(manifest)
-    return {
-        "mode": "local_demo",
-        "submitted_count": len(jobs),
-        "blocked_count": binding.get("blocked_count", 0),
-        "jobs": jobs,
-        "blocked": binding.get("blocked", []),
-        "registry_count": binding.get("registry_count", 0),
-    }
+    from .video_generation_service import submit_video_batch
+
+    return submit_video_batch(final_video_plan)
 
 
 VIDEO_OUTPUT_FIELDS = (
@@ -282,6 +367,9 @@ def compose_video_jobs(
     jobs: list[dict[str, Any]],
     project_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from .video_generation_service import prepare_compose_jobs
+
+    jobs = prepare_compose_jobs(jobs)
     compose_id = uuid.uuid4().hex
     compose_root = WORKFLOW_VIDEO_OUTPUT_ROOT / compose_id
     compose_root.mkdir(parents=True, exist_ok=True)
@@ -360,6 +448,7 @@ def compose_video_jobs(
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg 合成失败: {(result.stderr or result.stdout)[-2000:]}")
 
+    manifest_path = compose_root / "manifest.json"
     manifest = {
         "mode": "ffmpeg_concat",
         "compose_id": compose_id,
@@ -371,9 +460,10 @@ def compose_video_jobs(
         "output_path": str(output_path),
         "output_url": f"/workflow-videos/{output_name}",
         "concat_list": str(concat_path),
+        "manifest_path": str(manifest_path),
         "command": command,
     }
-    (compose_root / "manifest.json").write_text(
+    manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return manifest

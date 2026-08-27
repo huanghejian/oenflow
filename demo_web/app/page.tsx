@@ -13,6 +13,7 @@ import type {
   AssetPromptResponse,
   AssetSplitResponse,
   AssetRecord,
+  AssetUploadToken,
   AutoFlowAssets,
   ComposeResponse,
   FinalShot,
@@ -28,9 +29,12 @@ import type {
 } from "./components/autoflowTypes";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
+const VIDEO_POLL_MS = 10_000;
+const ACTIVE_VIDEO_STATUSES = new Set(["queued", "submitting", "running"]);
 type PromptTemplateName = "asset-split" | "asset-prompts" | "storyboard-split" | "shot-group-analysis" | "routing-analysis";
 type AssetPromptFilter = "all" | "characters" | "scenes" | "items";
 type NetworkMode = "direct" | "proxy";
+type ReferenceFrameRole = "entry" | "exit";
 type PromptVersion = {
   version: string;
   created_at?: string;
@@ -60,6 +64,7 @@ const FLOW_STEPS: Array<{ id: FlowStep; index: string; title: string; caption: s
   { id: "routing", index: "05", title: "路由与首尾帧", caption: "模型评分并行生图" },
   { id: "submit", index: "06", title: "视频生成", caption: "提交分镜视频任务" },
   { id: "compose", index: "07", title: "视频合成", caption: "ffmpeg 合并分镜视频" },
+  { id: "finale", index: "08", title: "终章", caption: "查看完整成片" },
 ];
 
 const EMPTY_ASSETS: AutoFlowAssets = { characters: [], scenes: [], items: [] };
@@ -149,6 +154,293 @@ async function readJson<T>(response: Response): Promise<T> {
   }
 }
 
+function jobHasVideoSource(job: NonNullable<SubmitResponse["jobs"]>[number]): boolean {
+  return Boolean(
+    job.output_url
+    || job.output_video_url
+    || job.video_url
+    || job.output_video_path
+    || job.output_path
+    || job.video_path,
+  );
+}
+
+function composableVideoCount(result: SubmitResponse | null): number {
+  return (result?.jobs || []).filter((job) => job.status === "succeeded" && jobHasVideoSource(job)).length;
+}
+
+function canComposeVideos(result: SubmitResponse | null): boolean {
+  return composableVideoCount(result) >= 2;
+}
+
+function videoSrc(job: NonNullable<SubmitResponse["jobs"]>[number]): string {
+  const source = job.output_url || job.output_video_url || job.video_url || "";
+  if (!source) return "";
+  return source.startsWith("/") ? `${API_BASE}${source}` : source;
+}
+
+function composeVideoSrc(result: ComposeResponse | null): string {
+  const source = result?.output_url || "";
+  if (!source) return "";
+  return source.startsWith("/") ? `${API_BASE}${source}` : source;
+}
+
+function rawAssetUrl(record?: AssetRecord | AssetItem | NonNullable<FinalShot["references"]>[number]): string {
+  return record?.public_url || record?.url || record?.image_url || "";
+}
+
+function isHttpUrl(value?: string): boolean {
+  return /^https?:\/\//i.test(value || "");
+}
+
+function assetRecordUrl(record?: AssetRecord): string {
+  const source = rawAssetUrl(record);
+  if (!source) return "";
+  return isHttpUrl(source) ? source : `${API_BASE}${source}`;
+}
+
+function displayImageUrl(imageUrl: string): string {
+  return isHttpUrl(imageUrl) ? imageUrl : `${API_BASE}${imageUrl}`;
+}
+
+function imageExtension(contentType: string): string {
+  if (contentType.includes("jpeg") || contentType.includes("jpg")) return "jpg";
+  if (contentType.includes("webp")) return "webp";
+  return "png";
+}
+
+function assetLookupText(value?: string): string {
+  return (value || "")
+    .replace(/\.(png|jpe?g|webp|gif)$/i, "")
+    .replace(/·基础状态|基础状态/g, "")
+    .replace(/[\s·_\-:：/\\（）()]/g, "");
+}
+
+function assetLookupTerms(...values: Array<string | undefined>): string[] {
+  const terms = new Set<string>();
+  for (const value of values) {
+    if (!value) continue;
+    terms.add(value);
+    terms.add(assetLookupText(value));
+  }
+  return [...terms].filter(Boolean);
+}
+
+function allAssetItems(assets: AutoFlowAssets): AssetItem[] {
+  return [
+    ...(assets.characters || []),
+    ...(assets.scenes || []),
+    ...(assets.items || []),
+  ];
+}
+
+function buildAssetUrlLookup(assets: AutoFlowAssets, registry: Record<string, AssetRecord>): Record<string, string> {
+  const lookup: Record<string, string> = {};
+  const registryRows = Object.entries(registry).map(([key, record]) => {
+    const url = rawAssetUrl(record);
+    const terms = assetLookupTerms(key, record.asset_id, record.original_filename);
+    for (const term of terms) {
+      if (url) lookup[term] = url;
+    }
+    return { key, record, url, terms: terms.map(assetLookupText).filter(Boolean) };
+  });
+  for (const asset of allAssetItems(assets)) {
+    const terms = assetLookupTerms(asset.id, asset.gid, asset.name);
+    let url = rawAssetUrl(asset);
+    if (!url) {
+      const normalized = terms.map(assetLookupText).filter(Boolean);
+      const matched = registryRows.find((row) =>
+        row.url && row.terms.some((left) => normalized.some((right) => left.includes(right) || right.includes(left))),
+      );
+      url = matched?.url || "";
+    }
+    if (url) {
+      for (const term of terms) lookup[term] = url;
+    }
+  }
+  return lookup;
+}
+
+function referenceRole(ref: NonNullable<FinalShot["references"]>[number]): "entry" | "exit" | "" {
+  const text = `${ref.asset_id || ""} ${ref.derived_role || ""} ${ref.generated_role || ""} ${ref.purpose || ""}`.toLowerCase();
+  if (text.includes("entry") || text.includes("开始") || text.includes("开场")) return "entry";
+  if (text.includes("exit") || text.includes("结束") || text.includes("尾帧")) return "exit";
+  return "";
+}
+
+function promptUsesAsset(prompt: string | undefined, assetId: string): boolean {
+  if (!prompt || !assetId) return false;
+  const escaped = assetId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`\\[${escaped}\\]`).test(prompt)
+    || new RegExp(`(^|[^A-Za-z0-9_])${escaped}($|[^A-Za-z0-9_])`).test(prompt);
+}
+
+function shotKey(shot: FinalShot): string {
+  return shot.shot_id || shot.group_id || "shot";
+}
+
+function missingShotAssetIds(
+  shot: FinalShot,
+  manifest: ReferenceManifest | undefined,
+  assetUrlLookup: Record<string, string>,
+): string[] {
+  const missing = new Set<string>();
+  for (const ref of shot.references || []) {
+    const assetId = ref.asset_id || "";
+    if (!assetId || ref.required === false) continue;
+    if (!ref.derived && !promptUsesAsset(shot.prompt_zh, assetId)) continue;
+    const role = ref.derived ? referenceRole(ref) : "";
+    const referenceUrl = role === "entry" ? manifest?.entry?.image_url : role === "exit" ? manifest?.exit?.image_url : "";
+    const lookupUrl = assetUrlLookup[assetId] || assetUrlLookup[assetLookupText(assetId)];
+    const resolvedUrl = referenceUrl || rawAssetUrl(ref) || lookupUrl;
+    if (!resolvedUrl || (ref.derived && !isHttpUrl(resolvedUrl))) {
+      missing.add(assetId);
+    }
+  }
+  return [...missing];
+}
+
+function normalizeReferenceManifest(manifest: ReferenceManifest, assetUrlLookup: Record<string, string>): ReferenceManifest {
+  const patchFrame = (frame: ReferenceManifest["entry"]): ReferenceManifest["entry"] => {
+    if (!frame?.asset_id) return frame;
+    const s3Url = assetUrlLookup[frame.asset_id] || assetUrlLookup[assetLookupText(frame.asset_id)];
+    if (!isHttpUrl(s3Url)) return frame;
+    return {
+      ...frame,
+      image_url: s3Url,
+      url: s3Url,
+      public_url: s3Url,
+      status: "uploaded",
+    };
+  };
+  return {
+    ...manifest,
+    entry: patchFrame(manifest.entry),
+    exit: patchFrame(manifest.exit),
+  };
+}
+
+function patchReferenceFrameInRouteResult(
+  current: RouteResponse | null,
+  shot: FinalShot,
+  role: ReferenceFrameRole,
+  record: AssetRecord,
+): RouteResponse | null {
+  if (!current) return current;
+  const key = shotKey(shot);
+  const assetId = record.asset_id || (role === "entry" ? shot.reference_image_plan?.output_asset_ids?.entry : shot.reference_image_plan?.output_asset_ids?.exit) || "";
+  const registeredUrl = record.public_url || record.image_url || record.url || "";
+  const patchManifest = (manifest: ReferenceManifest): ReferenceManifest => {
+    if (manifest.shot_id !== key) return manifest;
+    return {
+      ...manifest,
+      status: "completed",
+      [role]: {
+        ...(manifest[role] || {}),
+        asset_id: assetId || manifest[role]?.asset_id,
+        image_url: registeredUrl || manifest[role]?.image_url,
+        url: registeredUrl || manifest[role]?.url,
+        public_url: registeredUrl || manifest[role]?.public_url,
+        s3_key: record.s3_key || manifest[role]?.s3_key,
+        status: "uploaded",
+      },
+    };
+  };
+  const completed = current.reference_generation?.completed || [];
+  const exists = completed.some((manifest) => manifest.shot_id === key);
+  const nextCompleted = exists
+    ? completed.map(patchManifest)
+    : [
+      ...completed,
+      patchManifest({
+        shot_id: key,
+        status: "completed",
+        [role]: { asset_id: assetId, image_url: registeredUrl, url: registeredUrl, public_url: registeredUrl, s3_key: record.s3_key, status: "uploaded" },
+      }),
+    ];
+  const nextShots = (current.final_video_plan?.shots || []).map((item) => {
+    if (shotKey(item) !== key) return item;
+    return {
+      ...item,
+      references: (item.references || []).map((ref) => {
+        if (ref.asset_id !== assetId && referenceRole(ref) !== role) return ref;
+        return { ...ref, url: registeredUrl, image_url: registeredUrl, public_url: registeredUrl };
+      }),
+    };
+  });
+  return {
+    ...current,
+    final_video_plan: current.final_video_plan ? { ...current.final_video_plan, shots: nextShots } : current.final_video_plan,
+    reference_generation: {
+      ...current.reference_generation,
+      completed: nextCompleted,
+      completed_count: nextCompleted.length,
+      blocked: (current.reference_generation?.blocked || []).filter((manifest) => manifest.shot_id !== key),
+    },
+  };
+}
+
+function patchAssetsWithRecord(assets: AutoFlowAssets, assetId: string, record: AssetRecord): AutoFlowAssets {
+  const patchAsset = (asset: AssetItem): AssetItem => {
+    if (asset.id !== assetId && asset.gid !== assetId) return asset;
+    return {
+      ...asset,
+      file_id: record.file_id,
+      url: record.url,
+      image_url: record.image_url || record.url,
+      public_url: record.public_url || record.url,
+      s3_key: record.s3_key,
+      source: record.source,
+      mime_type: record.mime_type,
+      size_bytes: record.size_bytes,
+    };
+  };
+  return {
+    characters: (assets.characters || []).map(patchAsset),
+    scenes: (assets.scenes || []).map(patchAsset),
+    items: (assets.items || []).map(patchAsset),
+  };
+}
+
+function patchAssetResponse<T extends { assets?: AutoFlowAssets }>(
+  result: T | null,
+  assetId: string,
+  record: AssetRecord,
+): T | null {
+  if (!result?.assets) return result;
+  return { ...result, assets: patchAssetsWithRecord(result.assets, assetId, record) };
+}
+
+function uploadFileWithProgress(
+  uploadUrl: string,
+  file: File,
+  headers: Record<string, string>,
+  onProgress: (percent: number) => void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("PUT", uploadUrl);
+    for (const [key, value] of Object.entries(headers)) {
+      request.setRequestHeader(key, value);
+    }
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return;
+      onProgress(Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100))));
+    };
+    request.onload = () => {
+      if (request.status >= 200 && request.status < 300) {
+        onProgress(100);
+        resolve();
+        return;
+      }
+      reject(new Error(`S3 上传失败（HTTP ${request.status}）`));
+    };
+    request.onerror = () => reject(new Error("S3 上传网络错误"));
+    request.onabort = () => reject(new Error("S3 上传已取消"));
+    request.send(file);
+  });
+}
+
 async function loadPromptTemplate(name: PromptTemplateName, fallback: string): Promise<string> {
   try {
     const response = await fetch(`${API_BASE}/v1/autoflow/prompts/${name}`, { cache: "no-store" });
@@ -228,6 +520,7 @@ export default function Home() {
   const [submitResult, setSubmitResult] = useState<SubmitResponse | null>(null);
   const [composeResult, setComposeResult] = useState<ComposeResponse | null>(null);
   const [assetRegistry, setAssetRegistry] = useState<Record<string, AssetRecord>>({});
+  const [uploadProgress, setUploadProgress] = useState<Record<string, number>>({});
   const [assetPromptFilter, setAssetPromptFilter] = useState<AssetPromptFilter>("all");
   const [assetPromptPreviewAsset, setAssetPromptPreviewAsset] = useState<AssetItem | null>(null);
   const [assetPromptPreviewVariant, setAssetPromptPreviewVariant] = useState("");
@@ -254,17 +547,18 @@ export default function Home() {
     return groups.flatMap((group) => group.items.map((asset) => ({ ...group, asset })));
   }, [assetPromptAssets]);
   const filteredAssetPromptCards = assetPromptFilter === "all" ? assetPromptCards : assetPromptCards.filter((item) => item.key === assetPromptFilter);
-  const readyAssetCount = assetPromptCards.filter((item) => assetRegistry[item.asset.id]).length;
+  const assetUrlLookup = useMemo(() => buildAssetUrlLookup(assetPromptAssets, assetRegistry), [assetPromptAssets, assetRegistry]);
+  const readyAssetCount = assetPromptCards.filter((item) => assetUrlLookup[item.asset.id] || assetUrlLookup[assetLookupText(item.asset.id)]).length;
   const referenceMap = useMemo(() => {
     const map: Record<string, ReferenceManifest> = {};
     for (const manifest of routeResult?.reference_generation?.completed || []) {
-      if (manifest.shot_id) map[manifest.shot_id] = manifest;
+      if (manifest.shot_id) map[manifest.shot_id] = normalizeReferenceManifest(manifest, assetUrlLookup);
     }
     for (const manifest of routeResult?.reference_generation?.blocked || []) {
-      if (manifest.shot_id && !map[manifest.shot_id]) map[manifest.shot_id] = manifest;
+      if (manifest.shot_id && !map[manifest.shot_id]) map[manifest.shot_id] = normalizeReferenceManifest(manifest, assetUrlLookup);
     }
     return map;
-  }, [routeResult]);
+  }, [assetUrlLookup, routeResult]);
   const generatedReferenceImageCount = useMemo(
     () => Object.values(referenceMap).reduce(
       (total, manifest) => total + Number(Boolean(manifest.entry?.image_url)) + Number(Boolean(manifest.exit?.image_url)),
@@ -272,6 +566,15 @@ export default function Home() {
     ),
     [referenceMap],
   );
+  const submitMissingAssetsByShot = useMemo(() => {
+    const map: Record<string, string[]> = {};
+    for (const shot of finalShots) {
+      const key = shotKey(shot);
+      map[key] = missingShotAssetIds(shot, referenceMap[key], assetUrlLookup);
+    }
+    return map;
+  }, [assetUrlLookup, finalShots, referenceMap]);
+  const hasSubmitMissingAssets = Object.values(submitMissingAssetsByShot).some((items) => items.length > 0);
   const routingDetailRoute = useMemo(() => {
     if (!routingDetailShotId) return undefined;
     return routingShots.find((route) => route.shot_id === routingDetailShotId || route.source_group === routingDetailShotId);
@@ -289,8 +592,52 @@ export default function Home() {
     if (routeResult) done.add("routing");
     if (submitResult) done.add("submit");
     if (composeResult) done.add("compose");
+    if (composeResult?.output_url) done.add("finale");
     return done;
   }, [analysisResult, assetPromptResult, assetResult, composeResult, routeResult, splitResult, submitResult]);
+  const pollingBatchId = submitResult?.batch_id || "";
+  const hasActiveVideoJobs = useMemo(
+    () => Boolean(submitResult?.jobs?.some((job) => ACTIVE_VIDEO_STATUSES.has(job.status || ""))),
+    [submitResult],
+  );
+  const activeVideoShotIds = useMemo(() => {
+    const shotIds = new Set<string>();
+    for (const job of submitResult?.jobs || []) {
+      if (job.shot_id && ACTIVE_VIDEO_STATUSES.has(job.status || "")) {
+        shotIds.add(job.shot_id);
+      }
+    }
+    return shotIds;
+  }, [submitResult]);
+  useEffect(() => {
+    if (!pollingBatchId || !hasActiveVideoJobs) return;
+
+    let cancelled = false;
+    async function refreshBatch() {
+      try {
+        const response = await fetch(
+          `${API_BASE}/v1/autoflow/video/batches/${pollingBatchId}`,
+          { cache: "no-store" },
+        );
+        const data = await readJson<SubmitResponse>(response);
+        if (cancelled || !response.ok) return;
+        setSubmitResult(data);
+        const readyCount = composableVideoCount(data);
+        if (readyCount >= 2) {
+          setNotice(`已有 ${readyCount} 个分镜视频，可以开始合成。`);
+        }
+      } catch {
+        // 单次轮询失败不清空任务，下一轮继续查询。
+      }
+    }
+
+    void refreshBatch();
+    const timer = window.setInterval(() => void refreshBatch(), VIDEO_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [hasActiveVideoJobs, pollingBatchId]);
   const currentStepIndex = Math.max(0, FLOW_STEPS.findIndex((step) => step.id === activeStep));
   const currentStep = FLOW_STEPS[currentStepIndex] || FLOW_STEPS[0];
   const progressPercent = ((currentStepIndex + 1) / FLOW_STEPS.length) * 100;
@@ -444,6 +791,7 @@ export default function Home() {
     if (step === "routing") return Boolean(analysisResult);
     if (step === "submit") return Boolean(routeResult);
     if (step === "compose") return Boolean(submitResult);
+    if (step === "finale") return Boolean(composeResult?.output_url);
     return true;
   }
 
@@ -684,22 +1032,108 @@ export default function Home() {
     }
   }
 
+  async function uploadImageAssetToS3(assetId: string, file: File, progressKey = assetId): Promise<AssetRecord & { detail?: string }> {
+    setUploadProgress((current) => ({ ...current, [progressKey]: 2 }));
+    const tokenResponse = await fetch(`${API_BASE}/v1/workflow/assets/upload-token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        asset_id: assetId,
+        filename: file.name,
+        content_type: file.type || "application/octet-stream",
+        size_bytes: file.size,
+      }),
+    });
+    const token = await readJson<AssetUploadToken>(tokenResponse);
+    if (!tokenResponse.ok) throw new Error(token.detail || "获取 S3 上传令牌失败");
+    setUploadProgress((current) => ({ ...current, [progressKey]: 5 }));
+    await uploadFileWithProgress(
+      token.upload_url,
+      file,
+      token.headers || { "Content-Type": token.content_type || file.type || "application/octet-stream" },
+      (percent) => setUploadProgress((current) => ({ ...current, [progressKey]: percent })),
+    );
+    const registerResponse = await fetch(`${API_BASE}/v1/workflow/assets/register-s3`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        asset_id: assetId,
+        s3_key: token.s3_key,
+        url: token.url || token.public_url,
+        content_type: token.content_type || file.type,
+        size_bytes: file.size,
+        original_filename: file.name,
+      }),
+    });
+    const data = await readJson<AssetRecord & { detail?: string }>(registerResponse);
+    if (!registerResponse.ok) throw new Error(data.detail || "登记 S3 图片失败");
+    const registeredUrl = data.public_url || data.image_url || data.url || "";
+    if (!isHttpUrl(registeredUrl)) {
+      throw new Error("S3 登记未返回 HTTP URL，请检查后端是否仍在使用旧上传接口。");
+    }
+    setAssetRegistry((current) => ({ ...current, [assetId]: data }));
+    return data;
+  }
+
   async function uploadAsset(assetId: string, file: File) {
     resetMessages();
     setBusy(`upload:${assetId}`);
     try {
-      const response = await fetch(`${API_BASE}/v1/workflow/assets/upload?asset_id=${encodeURIComponent(assetId)}`, {
-        method: "POST",
-        headers: { "Content-Type": file.type || "application/octet-stream", "X-Filename": encodeURIComponent(file.name) },
-        body: file,
-      });
-      const data = await readJson<AssetRecord & { detail?: string }>(response);
-      if (!response.ok) throw new Error(data.detail || "上传图片失败");
+      const data = await uploadImageAssetToS3(assetId, file);
+      const registeredUrl = data.public_url || data.image_url || data.url || "";
+      setAssetResult((current) => patchAssetResponse(current, assetId, data));
+      setAssetPromptResult((current) => patchAssetResponse(current, assetId, data));
+      setSplitResult((current) => patchAssetResponse(current, assetId, data));
       await refreshAssetRegistry();
-      setNotice(`${assetId} 已绑定到 ${file.name}`);
+      setNotice(`${assetId} 已上传到 S3 并绑定：${registeredUrl}`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "上传图片失败");
     } finally {
+      setUploadProgress((current) => {
+        const next = { ...current };
+        delete next[assetId];
+        return next;
+      });
+      setBusy("");
+    }
+  }
+
+  async function uploadReferenceFrame(shot: FinalShot, role: ReferenceFrameRole) {
+    const key = shotKey(shot);
+    const manifest = referenceMap[key];
+    const frame = manifest?.[role];
+    const assetId = frame?.asset_id || (role === "entry" ? shot.reference_image_plan?.output_asset_ids?.entry : shot.reference_image_plan?.output_asset_ids?.exit) || "";
+    const imageUrl = frame?.image_url || "";
+    if (!assetId || !imageUrl) {
+      setError(`${key} 缺少${role === "entry" ? "开始" : "结束"}站位图，无法上传。`);
+      return;
+    }
+    if (isHttpUrl(imageUrl)) {
+      setNotice(`${assetId} 已经是 S3/HTTP 图片，无需重复上传。`);
+      return;
+    }
+    resetMessages();
+    setBusy(`upload-reference:${assetId}`);
+    const progressKey = assetId;
+    try {
+      const imageResponse = await fetch(displayImageUrl(imageUrl), { cache: "no-store" });
+      if (!imageResponse.ok) throw new Error(`读取本地站位图失败（HTTP ${imageResponse.status}）`);
+      const blob = await imageResponse.blob();
+      const contentType = blob.type || imageResponse.headers.get("content-type") || "image/png";
+      const file = new File([blob], `${key}_${role}.${imageExtension(contentType)}`, { type: contentType });
+      const data = await uploadImageAssetToS3(assetId, file, progressKey);
+      const registeredUrl = data.public_url || data.image_url || data.url || "";
+      setRouteResult((current) => patchReferenceFrameInRouteResult(current, shot, role, data));
+      await refreshAssetRegistry();
+      setNotice(`${assetId} 已上传到 S3 并回写：${registeredUrl}`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "上传首尾站位图失败");
+    } finally {
+      setUploadProgress((current) => {
+        const next = { ...current };
+        delete next[progressKey];
+        return next;
+      });
       setBusy("");
     }
   }
@@ -880,10 +1314,21 @@ export default function Home() {
   async function runSubmit(targetShot?: FinalShot) {
     if (!routeResult?.final_video_plan) return;
     const finalVideoPlan = targetShot
-      ? { ...routeResult.final_video_plan, shots: [targetShot] }
+      ? { ...routeResult.final_video_plan, batch_shots: routeResult.final_video_plan.shots || [], shots: [targetShot] }
       : routeResult.final_video_plan;
     const shotLabel = targetShot?.shot_id || targetShot?.group_id || "当前镜头";
     resetMessages();
+    const blockedShot = (finalVideoPlan.shots || [])
+      .map((shot) => {
+        const key = shotKey(shot);
+        const missing = missingShotAssetIds(shot, referenceMap[key], assetUrlLookup);
+        return { key, missing };
+      })
+      .find((item) => item.missing.length > 0);
+    if (blockedShot) {
+      setError(`${blockedShot.key} 缺少必要素材：${blockedShot.missing.join("、")}。请先上传或生成对应图片。`);
+      return;
+    }
     setBusy(targetShot ? `submit:${shotLabel}` : "submit");
     if (!targetShot) {
       setSubmitResult(null);
@@ -893,24 +1338,16 @@ export default function Home() {
       const response = await fetch(`${API_BASE}/v1/autoflow/video/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_params: projectParams, final_video_plan: finalVideoPlan }),
+        body: JSON.stringify({
+          project_params: projectParams,
+          final_video_plan: finalVideoPlan,
+          regenerate_existing: Boolean(targetShot),
+        }),
       });
       const data = await readJson<SubmitResponse>(response);
       if (!response.ok) throw new Error(data.detail || "视频任务提交失败");
       if (targetShot) {
-        setSubmitResult((current) => {
-          const incomingJobs = data.jobs || [];
-          const incomingIds = new Set(incomingJobs.map((job) => job.shot_id).filter(Boolean));
-          const existingJobs = (current?.jobs || []).filter((job) => !job.shot_id || !incomingIds.has(job.shot_id));
-          const mergedJobs = [...existingJobs, ...incomingJobs];
-          return {
-            ...current,
-            ...data,
-            jobs: mergedJobs,
-            submitted_count: mergedJobs.length,
-            blocked: [...(current?.blocked || []), ...(data.blocked || [])],
-          };
-        });
+        setSubmitResult(data);
         setNotice(`${shotLabel} 视频任务提交完成：入队 ${data.submitted_count || 0}，阻塞 ${data.blocked_count || 0}。`);
       } else {
         setSubmitResult(data);
@@ -924,9 +1361,31 @@ export default function Home() {
     }
   }
 
+  async function loadLatestVideoBatch() {
+    resetMessages();
+    setBusy("video-batch-load");
+    try {
+      const response = await fetch(`${API_BASE}/v1/autoflow/video/batches/latest`, { cache: "no-store" });
+      const data = await readJson<SubmitResponse>(response);
+      if (!response.ok) throw new Error(data.detail || "加载最后一次生成视频数据失败");
+      setSubmitResult(data);
+      setActiveStep("submit");
+      setNotice(`已加载最后一次视频生成批次：${data.batch_id || "未知批次"}，入队 ${data.submitted_count || 0}，阻塞 ${data.blocked_count || 0}。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "加载最后一次生成视频数据失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function runCompose() {
     if (!submitResult?.jobs?.length) return;
     resetMessages();
+    const readyCount = composableVideoCount(submitResult);
+    if (readyCount < 2) {
+      setError("至少需要 2 个已生成视频才能合成。");
+      return;
+    }
     setBusy("compose");
     setComposeResult(null);
     try {
@@ -938,7 +1397,12 @@ export default function Home() {
       const data = await readJson<ComposeResponse>(response);
       if (!response.ok) throw new Error(data.detail || "视频合成失败");
       setComposeResult(data);
-      setNotice(data.output_url ? `视频合成完成：${data.input_count || 0} 个分镜已合并。` : data.message || "没有可合成的视频文件。");
+      if (data.output_url) {
+        setActiveStep("finale");
+        setNotice(`视频合成完成：${data.input_count || readyCount} 个分镜已合并。`);
+      } else {
+        setNotice(data.message || "没有可合成的视频文件。");
+      }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "视频合成失败");
     } finally {
@@ -1015,6 +1479,16 @@ export default function Home() {
                 <h2>{currentStep.title}</h2>
                 <p>{currentStep.caption}</p>
               </div>
+              {activeStep === "submit" && (
+                <button
+                  type="button"
+                  className="textButton autoHeroAction"
+                  onClick={() => void loadLatestVideoBatch()}
+                  disabled={Boolean(busy) || backendOnline !== true}
+                >
+                  {busy === "video-batch-load" ? "加载中..." : "加载视频列表"}
+                </button>
+              )}
               <div className="autoHeroStats">
                 <span><b>{segments.length}</b> 分镜</span>
                 <span><b>{shotGroups.length}</b> 镜头组</span>
@@ -1119,11 +1593,12 @@ export default function Home() {
           <div className="assetCenterGrid">
             {filteredAssetPromptCards.map(({ asset, key, label, glyph }) => {
               const record = assetRegistry[asset.id];
+              const imageUrl = assetRecordUrl(record);
               return (
                 <article className={record ? "assetCenterCard bound" : "assetCenterCard"} key={`${key}:${asset.id}`}>
                   <div className="assetCenterPreview">
                     <b>{label}</b>
-                    {record?.url ? <div className="assetCenterImage" style={{ backgroundImage: `url(${API_BASE}${record.url})` }} aria-label={asset.name} /> : <span>{glyph}</span>}
+                    {imageUrl ? <div className="assetCenterImage" style={{ backgroundImage: `url(${imageUrl})` }} aria-label={asset.name} /> : <span>{glyph}</span>}
                     <small>{record ? "素材已绑定" : "等待素材"}</small>
                   </div>
                   <div className="assetCenterCopy">
@@ -1189,12 +1664,15 @@ export default function Home() {
             {filteredAssetPromptCards.map(({ asset, key, label, glyph }) => {
               const record = assetRegistry[asset.id];
               const uploading = busy === `upload:${asset.id}`;
+              const uploadPercent = uploadProgress[asset.id] || 0;
+              const imageUrl = assetRecordUrl(record);
               return (
                 <article className={record ? "assetCenterCard bound" : "assetCenterCard"} key={`storyboard:${key}:${asset.id}`}>
                   <div className="assetCenterPreview">
                     <b>{label}</b>
-                    {record?.url ? <div className="assetCenterImage" style={{ backgroundImage: `url(${API_BASE}${record.url})` }} aria-label={asset.name} /> : <span>{glyph}</span>}
-                    <small>{record ? "素材已绑定" : "等待素材"}</small>
+                    {imageUrl ? <div className="assetCenterImage" style={{ backgroundImage: `url(${imageUrl})` }} aria-label={asset.name} /> : <span>{glyph}</span>}
+                    <small>{uploading ? `上传 ${uploadPercent}%` : record ? "素材已绑定" : "等待素材"}</small>
+                    {uploading ? <div className="assetUploadProgress"><span style={{ width: `${uploadPercent}%` }} /></div> : null}
                   </div>
                   <div className="assetCenterCopy">
                     <strong>{asset.name}</strong>
@@ -1213,7 +1691,7 @@ export default function Home() {
                           event.currentTarget.value = "";
                         }}
                       />
-                      <span>{uploading ? "上传中" : record ? "替换图片" : "上传图片"}</span>
+                      <span>{uploading ? `上传 ${uploadPercent}%` : record ? "替换图片" : "上传图片"}</span>
                     </label>
                     <button type="button" onClick={() => openAssetPromptPreview(asset)} disabled={!assetHasModelPrompts(asset)}>资产提示词</button>
                   </footer>
@@ -1402,7 +1880,13 @@ export default function Home() {
           <div className="cardHead">
             <div><span>06</span><div><h2>视频生成</h2><p>提交镜头组路由方案、首尾帧图片、资产图片和分镜提示词，等待每个分镜视频输出。</p></div></div>
             <div className="autoInlineActions submitRouteActions">
-              <button type="button" className="textButton" onClick={() => void runSubmit()} disabled={Boolean(busy) || !routeResult?.final_video_plan || generatedReferenceImageCount < finalShots.length * 2}>
+              <button
+                type="button"
+                className="textButton"
+                onClick={() => void runSubmit()}
+                disabled={Boolean(busy) || hasActiveVideoJobs || !routeResult?.final_video_plan || generatedReferenceImageCount < finalShots.length * 2 || hasSubmitMissingAssets}
+                title={hasActiveVideoJobs ? "已有视频任务生成中，请等待完成后再批量生成" : hasSubmitMissingAssets ? "存在缺失素材的镜头，需补齐后才能批量生成" : undefined}
+              >
                 {busy === "submit" ? "批量生成中..." : "批量生成"}
               </button>
             </div>
@@ -1415,11 +1899,16 @@ export default function Home() {
           </div>
           <div className="submitShotList">
             {finalShots.map((shot) => {
-              const manifest = shot.shot_id ? referenceMap[shot.shot_id] : undefined;
-              const shotLabel = shot.shot_id || shot.group_id || "shot";
+              const shotLabel = shotKey(shot);
+              const manifest = referenceMap[shotLabel];
               const route = routingShots.find((item) => item.shot_id === shotLabel || item.source_group === shotLabel);
-              const isShotSubmitting = busy === `submit:${shotLabel}`;
+              const hasActiveShotJob = activeVideoShotIds.has(shotLabel);
+              const isShotSubmitting = busy === `submit:${shotLabel}` || hasActiveShotJob;
               const hasReferencePair = Boolean(manifest?.entry?.image_url && manifest?.exit?.image_url);
+              const missingAssets = submitMissingAssetsByShot[shotLabel] || [];
+              const canGenerateShot = Boolean(routeResult?.final_video_plan) && hasReferencePair && missingAssets.length === 0 && !hasActiveShotJob;
+              const entryAssetId = manifest?.entry?.asset_id || shot.reference_image_plan?.output_asset_ids?.entry;
+              const exitAssetId = manifest?.exit?.asset_id || shot.reference_image_plan?.output_asset_ids?.exit;
               return (
                 <article className="submitVideoCard" key={shotLabel}>
                   <header className="submitVideoCardHead">
@@ -1442,7 +1931,8 @@ export default function Home() {
                           type="button"
                           className="textButton"
                           onClick={() => void runSubmit(shot)}
-                          disabled={Boolean(busy) || !routeResult?.final_video_plan || !hasReferencePair}
+                          disabled={Boolean(busy) || !canGenerateShot}
+                          title={hasActiveShotJob ? "该分镜已有生成中的视频任务" : missingAssets.length ? `缺少必要素材：${missingAssets.join("、")}` : !hasReferencePair ? "缺少首尾参考帧" : undefined}
                         >
                           {isShotSubmitting ? "生成中..." : "生成"}
                         </button>
@@ -1462,12 +1952,19 @@ export default function Home() {
                     plan={shot.reference_image_plan}
                     apiBase={API_BASE}
                     isGenerating={busy === "routing" || busy === "references"}
+                    uploadProgress={{
+                      entry: entryAssetId ? uploadProgress[entryAssetId] : undefined,
+                      exit: exitAssetId ? uploadProgress[exitAssetId] : undefined,
+                    }}
+                    uploadDisabled={Boolean(busy)}
+                    onUploadFrame={(role) => void uploadReferenceFrame(shot, role)}
                     compact
                   />
                   <footer>
                     <span>资产 {shot.references?.length || 0}</span>
                     <span>首帧 {manifest?.entry?.asset_id || (manifest?.status === "blocked" ? "失败" : "未生成")}</span>
                     <span>尾帧 {manifest?.exit?.asset_id || (manifest?.status === "blocked" ? "失败" : "未生成")}</span>
+                    {missingAssets.length ? <span>缺失 {missingAssets.join("、")}</span> : null}
                   </footer>
                 </article>
               );
@@ -1506,26 +2003,106 @@ export default function Home() {
         <section className="card autoFullCard">
           <div className="cardHead">
             <div><span>07</span><div><h2>视频合成</h2><p>读取第六步 job 输出里的分镜视频路径，调用 ffmpeg 合并为完整视频。</p></div></div>
-            <button type="button" className="textButton" onClick={() => void runCompose()} disabled={Boolean(busy) || !submitResult?.jobs?.length}>
+            <button
+              type="button"
+              className="textButton"
+              onClick={() => void runCompose()}
+              disabled={Boolean(busy) || !canComposeVideos(submitResult)}
+              title={!canComposeVideos(submitResult) ? "至少需要 2 个已生成视频才能合成" : undefined}
+            >
               {busy === "compose" ? "正在合成..." : "ffmpeg 合成视频"}
             </button>
           </div>
           <div className="submitSummary">
             <div><small>视频任务</small><strong>{submitResult?.jobs?.length || 0}</strong></div>
-            <div><small>合成输入</small><strong>{composeResult?.input_count || 0}</strong></div>
+            <div><small>可合成</small><strong>{composableVideoCount(submitResult)}</strong></div>
             <div><small>合成阻塞</small><strong>{composeResult?.blocked_count || 0}</strong></div>
+            <div><small>状态</small><strong>{composeResult?.status || "待合成"}</strong></div>
+          </div>
+          <div className="submitShotList">
+            {(submitResult?.jobs || []).map((job) => {
+              const source = videoSrc(job);
+              const jobShotId = job.shot_id || "";
+              const regenerateShot = finalShots.find((shot) => shotKey(shot) === jobShotId || shot.shot_id === jobShotId || shot.group_id === jobShotId);
+              const canRegenerateJob = Boolean(regenerateShot && routeResult?.final_video_plan && !busy);
+              const statusLabel = job.status === "succeeded"
+                ? "已完成"
+                : job.status === "failed" || job.status === "cancelled" || job.status === "blocked"
+                  ? "生成失败"
+                  : "生成中";
+              return (
+                <article className={`submitVideoCard videoJob-${job.status || "queued"}`} key={job.job_id || job.shot_id}>
+                  <header className="submitVideoCardHead">
+                    <div>
+                      <span>{job.shot_id || "分镜"}</span>
+                      <strong>{job.model || "视频模型"}</strong>
+                      <small>{job.provider || "等待提交"}</small>
+                    </div>
+                    <b>{statusLabel}</b>
+                  </header>
+                  {job.status === "succeeded" && source ? (
+                    <video src={source} controls preload="metadata">
+                      <track kind="captions" label="暂无字幕" />
+                    </video>
+                  ) : job.status === "failed" || job.status === "cancelled" || job.status === "blocked" ? (
+                    <div className="videoJobRetryPanel">
+                      <p className="videoJobError">{job.error_message || "视频生成失败"}</p>
+                      <button
+                        type="button"
+                        className="textButton"
+                        onClick={() => regenerateShot && void runSubmit(regenerateShot)}
+                        disabled={!canRegenerateJob}
+                        title={canRegenerateJob ? undefined : "需要先加载路由与首尾帧结果后才能重新生成"}
+                      >
+                        重新生成
+                      </button>
+                    </div>
+                  ) : (
+                    <p className="videoJobGenerating">生成中，系统每 10 秒自动查询一次结果…</p>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+          {composeResult?.output_url ? (
+            <div className="workflowJsonSummary autoBlockedSummary">
+              <div><span>合成完成</span><b>{composeResult.compose_id}</b></div>
+              <p>完整成片已保存，请进入第八步“终章”查看和播放。</p>
+            </div>
+          ) : composeResult ? (
+            <div className="workflowJsonSummary autoBlockedSummary"><div><span>合成结果</span><b>{composeResult.status || "blocked"}</b></div><pre>{JSON.stringify(composeResult, null, 2)}</pre></div>
+          ) : null}
+        </section>
+      )}
+
+      {activeStep === "finale" && (
+        <section className="card autoFullCard">
+          <div className="cardHead">
+            <div><span>08</span><div><h2>终章</h2><p>查看 ffmpeg 合成后的完整视频结果。</p></div></div>
+            {composeResult?.output_url ? (
+              <a className="textButton" href={composeVideoSrc(composeResult)} target="_blank" rel="noreferrer">打开完整视频</a>
+            ) : null}
+          </div>
+          <div className="submitSummary">
+            <div><small>合成 ID</small><strong>{composeResult?.compose_id || "未生成"}</strong></div>
+            <div><small>合成输入</small><strong>{composeResult?.input_count || 0}</strong></div>
+            <div><small>跳过</small><strong>{composeResult?.blocked_count || 0}</strong></div>
             <div><small>状态</small><strong>{composeResult?.status || "待合成"}</strong></div>
           </div>
           {composeResult?.output_url ? (
             <div className="workflowJsonSummary autoBlockedSummary">
-              <div><span>合成视频</span><b>{composeResult.compose_id}</b></div>
-              <video src={`${API_BASE}${composeResult.output_url}`} controls>
+              <div><span>完整成片</span><b>{composeResult.compose_id}</b></div>
+              <video src={composeVideoSrc(composeResult)} controls preload="metadata">
                 <track kind="captions" label="暂无字幕" />
               </video>
-              <a href={`${API_BASE}${composeResult.output_url}`} target="_blank" rel="noreferrer">打开合成视频</a>
+              <p>合成结果文件：{composeResult.manifest_path || "manifest.json"}</p>
             </div>
-          ) : null}
-          {composeResult && <div className="workflowJsonSummary autoBlockedSummary"><div><span>合成结果</span><b>{composeResult.status || "blocked"}</b></div><pre>{JSON.stringify(composeResult, null, 2)}</pre></div>}
+          ) : (
+            <div className="emptyState">
+              <strong>还没有合成结果</strong>
+              <p>请先回到第七步，至少选择 2 个已生成视频后执行 ffmpeg 合成。</p>
+            </div>
+          )}
         </section>
       )}
         </section>

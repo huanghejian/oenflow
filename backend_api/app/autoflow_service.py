@@ -34,7 +34,6 @@ from .workflow_service import (
     asset_reference_data_urls,
     missing_asset_ids,
     register_reference_pair,
-    submit_video_jobs,
 )
 
 
@@ -1536,6 +1535,79 @@ def _load_step_result(path: Path, *, missing_message: str, invalid_message: str)
 
 def _save_asset_split_result(result: dict[str, Any]) -> None:
     _save_step_result(AUTOFLOW_ASSET_RESULT_PATH, result, "autoflow.assets.saved")
+
+
+def _asset_matches(item: Any, asset_id: str) -> bool:
+    return isinstance(item, dict) and asset_id in {
+        str(item.get("id") or ""),
+        str(item.get("gid") or ""),
+        str(item.get("asset_id") or ""),
+    }
+
+
+def _apply_asset_binding(item: dict[str, Any], binding: dict[str, Any]) -> None:
+    for key in (
+        "url",
+        "image_url",
+        "public_url",
+        "s3_key",
+        "file_id",
+        "mime_type",
+        "size_bytes",
+        "original_filename",
+        "source",
+    ):
+        if binding.get(key) is not None:
+            item[key] = binding[key]
+
+
+def _sync_asset_container(container: Any, asset_id: str, binding: dict[str, Any]) -> bool:
+    updated = False
+    if isinstance(container, dict):
+        assets = container.get("assets")
+        if isinstance(assets, dict):
+            for key in ("characters", "scenes", "items"):
+                items = assets.get(key)
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if _asset_matches(item, asset_id):
+                        _apply_asset_binding(item, binding)
+                        updated = True
+        elif isinstance(assets, list):
+            for item in assets:
+                if _asset_matches(item, asset_id):
+                    _apply_asset_binding(item, binding)
+                    updated = True
+        raw_prompt_result = container.get("asset_prompt_result")
+        if isinstance(raw_prompt_result, dict):
+            updated = _sync_asset_container(raw_prompt_result, asset_id, binding) or updated
+    elif isinstance(container, list):
+        for item in container:
+            if _asset_matches(item, asset_id):
+                _apply_asset_binding(item, binding)
+                updated = True
+    return updated
+
+
+def sync_uploaded_asset_reference(asset_id: str, binding: dict[str, Any]) -> dict[str, Any]:
+    updated_files: list[str] = []
+    for path in (
+        AUTOFLOW_ASSET_RESULT_PATH,
+        AUTOFLOW_ASSET_IDENTIFY_RESULT_PATH,
+        AUTOFLOW_ASSET_PROMPT_RESULT_PATH,
+    ):
+        if not path.is_file():
+            continue
+        result = _load_step_result(
+            path,
+            missing_message="资产数据文件不存在。",
+            invalid_message=f"资产数据文件无效：{path}",
+        )
+        if _sync_asset_container(result, asset_id, binding):
+            _save_step_result(path, result, "autoflow.assets.upload.synced")
+            updated_files.append(str(path))
+    return {"updated_files": updated_files}
 
 
 def load_latest_asset_split_result() -> dict[str, Any]:
@@ -3299,5 +3371,16 @@ def regenerate_latest_reference_images(
     return result
 
 
-def submit_autoflow_video_jobs(final_video_plan: dict[str, Any]) -> dict[str, Any]:
-    return submit_video_jobs(final_video_plan)
+def submit_autoflow_video_jobs(
+    final_video_plan: dict[str, Any],
+    project_params: dict[str, Any] | None = None,
+    *,
+    regenerate_existing: bool = False,
+) -> dict[str, Any]:
+    from .video_generation_service import submit_video_batch
+
+    return submit_video_batch(
+        final_video_plan,
+        project_params,
+        regenerate_existing=regenerate_existing,
+    )

@@ -85,6 +85,22 @@ class WorkflowPlanRequest(BaseModel):
     final_video_plan: dict[str, Any]
 
 
+class WorkflowAssetUploadTokenRequest(BaseModel):
+    asset_id: str = Field(min_length=1, max_length=120)
+    filename: str | None = Field(default=None, max_length=260)
+    content_type: str = Field(min_length=1, max_length=100)
+    size_bytes: int = Field(gt=0, le=15 * 1024 * 1024)
+
+
+class WorkflowAssetRegisterS3Request(BaseModel):
+    asset_id: str = Field(min_length=1, max_length=120)
+    s3_key: str = Field(min_length=1, max_length=1024)
+    url: str | None = Field(default=None, max_length=4096)
+    content_type: str | None = Field(default=None, max_length=100)
+    size_bytes: int | None = Field(default=None, gt=0, le=15 * 1024 * 1024)
+    original_filename: str | None = Field(default=None, max_length=260)
+
+
 class AutoFlowProjectParams(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -185,6 +201,7 @@ class AutoFlowReferenceRegenerateRequest(BaseModel):
 class AutoFlowSubmitRequest(BaseModel):
     project_params: AutoFlowProjectParams = Field(default_factory=AutoFlowProjectParams)
     final_video_plan: dict[str, Any]
+    regenerate_existing: bool = False
 
 
 class AutoFlowComposeRequest(BaseModel):

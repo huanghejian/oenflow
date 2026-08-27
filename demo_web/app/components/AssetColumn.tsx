@@ -12,10 +12,16 @@ type AssetColumnProps = {
 
 function sourceLabel(record?: AssetRecord): string {
   if (!record) return "待上传";
-  if (record.source === "user_upload") return "用户图片";
+  if (record.source === "user_upload" || record.source === "user_upload_s3" || record.source === "user_upload_s3_direct") return "用户图片";
   if (record.source === "bundled_demo_asset") return "内置图片";
   if (record.source === "derived_reference_image") return "生成图";
   return "已绑定";
+}
+
+function assetImageSrc(apiBase: string, record?: AssetRecord): string {
+  const source = record?.url || record?.image_url || record?.public_url || "";
+  if (!source) return "";
+  return /^https?:\/\//i.test(source) ? source : `${apiBase}${source}`;
 }
 
 function assetPrompt(asset: AssetItem): string {
@@ -36,10 +42,11 @@ export default function AssetColumn({ title, caption, assets, registry, apiBase,
         {assets.map((asset) => {
           const record = registry[asset.id];
           const uploading = busyKey === `upload:${asset.id}`;
+          const imageSrc = assetImageSrc(apiBase, record);
           return (
             <article className={record ? "autoAssetCard bound" : "autoAssetCard"} key={asset.id}>
               <div className="assetPreview">
-                {record?.url ? <img src={`${apiBase}${record.url}`} alt={asset.name} /> : <span aria-label="未上传图片">+</span>}
+                {imageSrc ? <img src={imageSrc} alt={asset.name} /> : <span aria-label="未上传图片">+</span>}
               </div>
               <div className="assetCopy">
                 <strong>{asset.name}</strong>

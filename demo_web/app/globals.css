@@ -446,6 +446,50 @@ input:focus,select:focus,textarea:focus { border-color:var(--blue); box-shadow:0
   .groupPrompts,.routeRefs,.submitSummary { grid-template-columns:1fr; }
 }
 
+.submitVideoCard > video {
+  display:block;
+  width:100%;
+  max-height:360px;
+  background:#0d0b14;
+}
+
+.videoJobGenerating,
+.videoJobError {
+  margin:0;
+  padding:22px 16px;
+  border-top:1px solid #eeeaf5;
+  color:#756f82;
+  font-size:13px;
+}
+
+.videoJobError {
+  color:#b84848;
+}
+
+.videoJobRetryPanel {
+  padding:14px 16px;
+  border-top:1px solid #eeeaf5;
+}
+
+.videoJobRetryPanel .videoJobError {
+  padding:0;
+  border-top:0;
+}
+
+.videoJobRetryPanel .textButton {
+  margin-top:12px;
+}
+
+.videoJob-succeeded {
+  border-color:#b8ddca !important;
+}
+
+.videoJob-failed,
+.videoJob-cancelled,
+.videoJob-blocked {
+  border-color:#edc1c1 !important;
+}
+
 /* newoneflow visual shell for oenflow */
 :root {
   --ink:#17171d;
@@ -1284,6 +1328,17 @@ textarea:focus {
   margin-bottom:16px;
 }
 
+.autoHeroAction {
+  margin-left:auto;
+  width:118px;
+  height:61px;
+  border-radius:10px;
+  background:#fff;
+  font-size:10px;
+  font-weight:700;
+  white-space:nowrap;
+}
+
 .assetCenterHero span {
   color:#9a95ad;
   font-size:10px;
@@ -1515,6 +1570,23 @@ textarea:focus {
   background-position:center;
   background-repeat:no-repeat;
   background-size:contain;
+}
+
+.assetUploadProgress {
+  position:absolute;
+  right:0;
+  bottom:0;
+  left:0;
+  height:5px;
+  overflow:hidden;
+  background:rgba(213,242,226,.9);
+}
+
+.assetUploadProgress span {
+  display:block;
+  height:100%;
+  background:#29c873;
+  transition:width .16s ease;
 }
 
 .assetCenterCopy {
@@ -2798,7 +2870,12 @@ textarea:focus {
   box-shadow:0 0 0 2px rgba(111,78,230,.1);
 }
 
-.frameSlot.state-completed { border-color:#8fcfb1; }
+.frameSlot.state-completed { border-color:#f2b86d; }
+.frameSlot.state-uploaded { border-color:#8fcfb1; }
+.frameSlot.state-uploading {
+  border-color:#8b73f2;
+  box-shadow:0 0 0 2px rgba(111,78,230,.1);
+}
 .frameSlot.state-failed { border-color:#e4a29c; }
 
 .routeRefs .frameSlotCanvas {
@@ -2873,6 +2950,32 @@ textarea:focus {
   backdrop-filter:blur(8px);
 }
 
+button.frameSlotStatus {
+  cursor:pointer;
+}
+
+button.frameSlotStatus:disabled {
+  cursor:not-allowed;
+  opacity:.62;
+}
+
+.frameSlotUploadButton {
+  color:#ffe4bd;
+  border-color:rgba(242,184,109,.55);
+}
+
+.frameSlotUploadButton .hoverLabel {
+  display:none;
+}
+
+.frameSlotUploadButton:hover .normalLabel {
+  display:none;
+}
+
+.frameSlotUploadButton:hover .hoverLabel {
+  display:inline;
+}
+
 .frameSlotStatus i {
   width:6px;
   height:6px;
@@ -2881,7 +2984,15 @@ textarea:focus {
 }
 
 .state-generating .frameSlotStatus i { background:#a997ff; animation:frameStatusBlink .9s ease-in-out infinite; }
-.state-completed .frameSlotStatus i { background:#5fd19a; }
+.state-completed .frameSlotStatus i { background:#f2b86d; }
+.state-uploaded .frameSlotStatus i { background:#5fd19a; }
+.state-uploading .frameSlotStatus {
+  border:1px solid transparent;
+  background:
+    linear-gradient(rgba(28,26,35,.88),rgba(28,26,35,.88)) padding-box,
+    linear-gradient(90deg,#5fd19a var(--frame-upload-progress,0%),rgba(255,255,255,.18) 0) border-box;
+}
+.state-uploading .frameSlotStatus i { background:#a997ff; animation:frameStatusBlink .9s ease-in-out infinite; }
 .state-failed .frameSlotStatus i { background:#ee776e; }
 
 .referenceGenerationLive,
@@ -3228,14 +3339,28 @@ textarea:focus {
   object-fit:contain;
 }
 
-.submitShotList .frameSlots.compact .frameSlot.state-completed .frameSlotCanvas {
+.submitShotList .frameSlots.compact .frameSlot.state-completed,
+.submitShotList .frameSlots.compact .frameSlot.state-uploaded,
+.submitShotList .frameSlots.compact .frameSlot.state-uploading {
   height:300px;
+  display:flex;
+  flex-direction:column;
+}
+
+.submitShotList .frameSlots.compact .frameSlot.state-completed .frameSlotCanvas,
+.submitShotList .frameSlots.compact .frameSlot.state-uploaded .frameSlotCanvas,
+.submitShotList .frameSlots.compact .frameSlot.state-uploading .frameSlotCanvas {
+  flex:1 1 auto;
+  min-height:0;
+  height:auto;
   display:flex;
   align-items:center;
   justify-content:center;
 }
 
-.submitShotList .frameSlots.compact .frameSlot.state-completed .frameSlotCanvas img {
+.submitShotList .frameSlots.compact .frameSlot.state-completed .frameSlotCanvas img,
+.submitShotList .frameSlots.compact .frameSlot.state-uploaded .frameSlotCanvas img,
+.submitShotList .frameSlots.compact .frameSlot.state-uploading .frameSlotCanvas img {
   width:auto;
   height:auto;
   max-width:100%;

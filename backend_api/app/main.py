@@ -4,6 +4,7 @@ import logging
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,8 @@ from .contracts import (
     AutoFlowSplitRequest,
     AutoFlowStoryboardSplitRequest,
     AutoFlowSubmitRequest,
+    WorkflowAssetRegisterS3Request,
+    WorkflowAssetUploadTokenRequest,
     BindRequest,
     CompileRequest,
     ContinuityAnalyzeRequest,
@@ -47,6 +50,7 @@ from .autoflow_service import (
     split_script_assets,
     split_script_assets_and_segments,
     split_script_storyboard,
+    sync_uploaded_asset_reference,
     submit_autoflow_video_jobs,
 )
 from .continuity_service import analyze_shot_continuity
@@ -74,6 +78,11 @@ from .logging_utils import (
     set_request_id,
 )
 from .pipeline_service import compile_video_plan
+from .video_generation_service import get_batch, get_job, get_latest_batch, retry_job
+from .video_poll_scheduler import (
+    start_video_poll_scheduler,
+    stop_video_poll_scheduler,
+)
 from .reference_image_service import (
     DEMO_IMAGE_ROOT,
     GENERATED_IMAGE_ROOT,
@@ -90,7 +99,9 @@ from .workflow_service import (
     asset_reference_data_urls,
     auto_bind_video_plan,
     compose_video_jobs,
+    create_asset_upload_token,
     missing_asset_ids,
+    register_s3_uploaded_asset,
     register_reference_pair,
     registry_snapshot,
     save_uploaded_asset,
@@ -111,7 +122,20 @@ PROMPT_TEMPLATE_FILES = {
 }
 PROMPT_TEMPLATE_VERSION_ROOT = PROMPT_TEMPLATE_ROOT / "versions"
 PROMPT_VERSION_RE = re.compile(r"^2\.0\.(\d+)$")
-app = FastAPI(title="Short Drama Video Planning API", version="1.0.0")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    start_video_poll_scheduler()
+    yield
+    stop_video_poll_scheduler()
+
+
+app = FastAPI(
+    title="Short Drama Video Planning API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:9001", "http://127.0.0.1:9001"],
@@ -471,6 +495,36 @@ def workflow_seed_demo_assets() -> dict:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@app.post("/v1/workflow/assets/upload-token")
+def workflow_asset_upload_token(request: WorkflowAssetUploadTokenRequest) -> dict:
+    try:
+        return create_asset_upload_token(
+            request.asset_id,
+            content_type=request.content_type,
+            size_bytes=request.size_bytes,
+            original_filename=request.filename,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/v1/workflow/assets/register-s3")
+def workflow_register_s3_asset(request: WorkflowAssetRegisterS3Request) -> dict:
+    try:
+        record = register_s3_uploaded_asset(
+            request.asset_id,
+            s3_key=request.s3_key,
+            url=request.url,
+            content_type=request.content_type,
+            size_bytes=request.size_bytes,
+            original_filename=request.original_filename,
+        )
+        record["synced_asset_files"] = sync_uploaded_asset_reference(request.asset_id, record)["updated_files"]
+        return record
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.post("/v1/workflow/assets/upload")
 async def workflow_upload_asset(asset_id: str, request: Request) -> dict:
     try:
@@ -772,7 +826,50 @@ def autoflow_submit_video(request: AutoFlowSubmitRequest) -> dict:
     return _run_logged_endpoint(
         "autoflow.video.submit",
         payload,
-        lambda: submit_autoflow_video_jobs(request.final_video_plan),
+        lambda: submit_autoflow_video_jobs(
+            request.final_video_plan,
+            request.project_params.model_dump(),
+            regenerate_existing=request.regenerate_existing,
+        ),
+    )
+
+
+@app.get("/v1/autoflow/video/batches/latest")
+def autoflow_get_latest_video_batch() -> dict:
+    try:
+        return get_latest_batch(refresh=False)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail="暂无视频生成批次"
+        ) from exc
+
+
+@app.get("/v1/autoflow/video/batches/{batch_id}")
+def autoflow_get_video_batch(batch_id: str) -> dict:
+    try:
+        return get_batch(batch_id, refresh=False)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"视频批次不存在: {batch_id}"
+        ) from exc
+
+
+@app.get("/v1/autoflow/video/jobs/{job_id}")
+def autoflow_get_video_job(job_id: str) -> dict:
+    try:
+        return get_job(job_id, refresh=True)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"视频任务不存在: {job_id}"
+        ) from exc
+
+
+@app.post("/v1/autoflow/video/jobs/{job_id}/retry")
+def autoflow_retry_video_job(job_id: str) -> dict:
+    return _run_logged_endpoint(
+        "autoflow.video.retry",
+        {"job_id": job_id},
+        lambda: retry_job(job_id),
     )
 
 

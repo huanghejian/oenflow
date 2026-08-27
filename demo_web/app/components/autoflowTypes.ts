@@ -1,4 +1,4 @@
-export type FlowStep = "split" | "assetPrompts" | "assets" | "analysis" | "routing" | "submit" | "compose";
+export type FlowStep = "split" | "assetPrompts" | "assets" | "analysis" | "routing" | "submit" | "compose" | "finale";
 export type RoutingTier = "low" | "medium" | "high";
 export type GenerationMode = "demo" | "openrouter" | "xingtu";
 
@@ -21,6 +21,14 @@ export type AssetItem = {
   prompt?: string;
   description?: string;
   localized_prompt?: string;
+  file_id?: string;
+  url?: string;
+  image_url?: string;
+  public_url?: string;
+  s3_key?: string;
+  source?: string;
+  mime_type?: string;
+  size_bytes?: number;
 };
 
 export type AutoFlowAssets = {
@@ -33,10 +41,31 @@ export type AssetRecord = {
   asset_id?: string;
   file_id?: string;
   url?: string;
+  image_url?: string;
+  public_url?: string;
+  local_url?: string;
+  s3_key?: string;
   source?: string;
+  mime_type?: string;
   original_filename?: string;
   size_bytes?: number;
   binding_status?: string;
+};
+
+export type AssetUploadToken = {
+  asset_id?: string;
+  method?: "PUT" | string;
+  upload_url: string;
+  headers?: Record<string, string>;
+  s3_key: string;
+  url: string;
+  public_url?: string;
+  content_type?: string;
+  size_bytes?: number;
+  original_filename?: string;
+  expires_in?: number;
+  max_size_bytes?: number;
+  detail?: string;
 };
 
 export type Dialogue = {
@@ -212,7 +241,19 @@ export type FinalShot = {
   model_params?: { resolution_preset?: string };
   duration?: number;
   prompt_zh?: string;
-  references?: Array<{ asset_id?: string; media_type?: string; required?: boolean; derived?: boolean; purpose?: string }>;
+  references?: Array<{
+    asset_id?: string;
+    media_type?: string;
+    asset_type?: string;
+    required?: boolean;
+    derived?: boolean;
+    purpose?: string;
+    derived_role?: string;
+    generated_role?: string;
+    url?: string;
+    image_url?: string;
+    public_url?: string;
+  }>;
   reference_image_plan?: {
     input_asset_ids?: string[];
     output_asset_ids?: { entry?: string; exit?: string };
@@ -235,8 +276,8 @@ export type ReferenceManifest = {
   size?: string;
   input_asset_ids?: string[];
   missing_asset_ids?: string[];
-  entry?: { asset_id?: string; image_url?: string; prompt_zh?: string; status?: string };
-  exit?: { asset_id?: string; image_url?: string; prompt_zh?: string; status?: string };
+  entry?: { asset_id?: string; image_url?: string; url?: string; public_url?: string; s3_key?: string; prompt_zh?: string; status?: string };
+  exit?: { asset_id?: string; image_url?: string; url?: string; public_url?: string; s3_key?: string; prompt_zh?: string; status?: string };
 };
 
 export type RouteResponse = {
@@ -264,13 +305,23 @@ export type RouteResponse = {
 };
 
 export type SubmitResponse = {
+  batch_id?: string;
+  status?: string;
+  batch_status?: string;
   submitted_count?: number;
   blocked_count?: number;
+  succeeded_count?: number;
+  failed_count?: number;
+  running_count?: number;
   registry_count?: number;
   mode?: string;
   jobs?: Array<{
     job_id?: string;
+    batch_id?: string;
     shot_id?: string;
+    model?: string;
+    provider?: string;
+    provider_task_id?: string;
     status?: string;
     bound_asset_ids?: string[];
     derived_reference_ids?: string[];
@@ -278,7 +329,10 @@ export type SubmitResponse = {
     output_path?: string;
     video_path?: string;
     output_video_url?: string;
+    output_url?: string;
     video_url?: string;
+    error_code?: string;
+    error_message?: string;
   }>;
   blocked?: unknown[];
   detail?: string;
@@ -293,6 +347,7 @@ export type ComposeResponse = {
   blocked?: unknown[];
   output_path?: string;
   output_url?: string;
+  manifest_path?: string;
   message?: string;
   detail?: string;
 };

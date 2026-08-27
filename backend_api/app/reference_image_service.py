@@ -24,6 +24,23 @@ def demo_reference_images_available() -> bool:
     ).is_file()
 
 
+def _publish_reference_images(manifest: dict[str, Any]) -> dict[str, Any]:
+    """生成完成后立即把首尾帧上传 S3，并回写持久化 URL。"""
+    from .s3_asset_service import publish_image_asset
+
+    for key in ("entry", "exit"):
+        item = manifest.get(key)
+        if not isinstance(item, dict) or not item.get("image_url"):
+            continue
+        published = publish_image_asset(str(item["image_url"]))
+        item.update(published)
+        item["image_url"] = published["url"]
+    entry_url = (manifest.get("entry") or {}).get("image_url")
+    if entry_url and isinstance(manifest.get("exit"), dict):
+        manifest["exit"]["source_image_url"] = entry_url
+    return manifest
+
+
 def create_reference_image_pair_job(payload: dict[str, Any]) -> dict[str, Any]:
     job_id = uuid.uuid4().hex
     job_root = settings.work_root / "reference_images" / job_id
@@ -73,6 +90,7 @@ def create_reference_image_pair_job(payload: dict[str, Any]) -> dict[str, Any]:
             "当前尚未配置图片模型执行器。"
         )
 
+    _publish_reference_images(manifest)
     (job_root / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -293,6 +311,7 @@ def create_reference_image_pair_provider_job(
             "source_image_url": entry_url,
         }
     )
+    _publish_reference_images(manifest)
     manifest_path = settings.work_root / "reference_images" / job_id / "manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -361,6 +380,7 @@ def create_reference_image_pair_xingtu_job(payload: dict[str, Any]) -> dict[str,
             "prompt_zh": exit_prompt,
         }
     )
+    _publish_reference_images(manifest)
     manifest_path = settings.work_root / "reference_images" / job_id / "manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
