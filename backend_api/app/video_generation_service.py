@@ -282,6 +282,27 @@ def submit_video_batch(
         if _video_job_slot_key(job.get("shot_id"))
     }
     existing_job_ids = [job.get("job_id") for job in existing_jobs]
+    ready_slot_keys = [
+        _video_job_slot_key(ready.get("shot_id"))
+        for ready in binding.get("ready", [])
+        if _video_job_slot_key(ready.get("shot_id"))
+    ]
+    has_active_existing = any(
+        (existing_by_slot.get(slot_key) or {}).get("status") in ACTIVE_STATUSES
+        and (existing_by_slot.get(slot_key) or {}).get("status") != "pending"
+        for slot_key in ready_slot_keys
+    )
+    all_ready_have_video = (
+        bool(ready_slot_keys)
+        and not binding.get("blocked")
+        and all(
+            existing_by_slot.get(slot_key)
+            and _job_has_video_result(existing_by_slot[slot_key])
+            for slot_key in ready_slot_keys
+        )
+    )
+    if not regenerate_existing and all_ready_have_video and not has_active_existing:
+        regenerate_existing = True
     jobs: list[dict[str, Any]] = []
     for ready in binding.get("ready", []):
         provider_payload = ready.get("provider_payload") or {}
@@ -356,6 +377,7 @@ def submit_video_batch(
             "registry_count": binding.get("registry_count", 0),
             "include_reference_frames": binding.get("include_reference_frames"),
             "rewrite_prompt": binding.get("rewrite_prompt"),
+            "regenerate_existing": regenerate_existing,
             "plan_signature": plan_signature,
             "plan_shot_count": len(final_video_plan.get("batch_shots") or final_video_plan.get("shots") or []),
         }
