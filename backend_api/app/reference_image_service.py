@@ -24,23 +24,6 @@ def demo_reference_images_available() -> bool:
     ).is_file()
 
 
-def _publish_reference_images(manifest: dict[str, Any]) -> dict[str, Any]:
-    """生成完成后立即把首尾帧上传 S3，并回写持久化 URL。"""
-    from .s3_asset_service import publish_image_asset
-
-    for key in ("entry", "exit"):
-        item = manifest.get(key)
-        if not isinstance(item, dict) or not item.get("image_url"):
-            continue
-        published = publish_image_asset(str(item["image_url"]))
-        item.update(published)
-        item["image_url"] = published["url"]
-    entry_url = (manifest.get("entry") or {}).get("image_url")
-    if entry_url and isinstance(manifest.get("exit"), dict):
-        manifest["exit"]["source_image_url"] = entry_url
-    return manifest
-
-
 def create_reference_image_pair_job(payload: dict[str, Any]) -> dict[str, Any]:
     job_id = uuid.uuid4().hex
     job_root = settings.work_root / "reference_images" / job_id
@@ -90,7 +73,6 @@ def create_reference_image_pair_job(payload: dict[str, Any]) -> dict[str, Any]:
             "当前尚未配置图片模型执行器。"
         )
 
-    _publish_reference_images(manifest)
     (job_root / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -167,9 +149,10 @@ def _xingtu_request_payload(
     model: str,
     aspect_ratio: str,
     size: str,
+    input_references: list[str] | None = None,
 ) -> dict[str, Any]:
     ratio = (aspect_ratio or "9:16").strip() or "9:16"
-    return {
+    payload: dict[str, Any] = {
         "model": model,
         "prompt": f"【图片比例{ratio}】{prompt}",
         "sequential_image_generation": "disabled",
@@ -178,13 +161,18 @@ def _xingtu_request_payload(
         "size": size,
         "output_format": "jpeg",
     }
+    if input_references:
+        payload["image"] = list(input_references)
+    return payload
 
 
-def _station_lineart_prompt(prompt: str, state_label: str) -> str:
+def _station_finished_prompt(prompt: str, state_label: str) -> str:
     return (
-        f"竖屏 9:16 短剧分镜{state_label}站位线稿，黑白干净线描，白底，无上色，无阴影渲染，"
-        "人物位置、身体朝向、前中后景层次和镜头构图必须清晰，"
-        "保留必要环境轮廓与关键道具轮廓，禁止字幕、字卡、水印和额外文字。"
+        f"竖屏 9:16 短剧分镜{state_label}完整参考图，全彩高完成度成片，"
+        "严格融合并继承输入角色、场景和道具图片的造型、颜色、材质、光影与视觉风格，"
+        "人物位置、身体朝向、表情、动作、前中后景层次和镜头构图必须清晰，"
+        "环境、材质和关键道具细节完整，画面可直接作为视频生成的首尾帧。"
+        "禁止线稿、草图、白底设定稿、低细节占位图，禁止字幕、字卡、水印和额外文字。"
         f"镜头状态：{prompt}"
     )
 
@@ -194,13 +182,14 @@ def _call_xingtu_image(
     model: str,
     aspect_ratio: str,
     size: str,
+    input_references: list[str] | None = None,
 ) -> tuple[bytes, str, dict[str, Any]]:
     if not settings.xingtu_image_api_key:
         raise RuntimeError("未配置 XINGTU_IMAGE_API_KEY，无法执行星图 5.0 Pro 生图")
     if size not in {"1K", "2K", "4K"}:
         raise RuntimeError(f"星图图片尺寸必须是 1K、2K 或 4K，当前为：{size}")
     request_payload = _xingtu_request_payload(
-        prompt, model, aspect_ratio, size
+        prompt, model, aspect_ratio, size, input_references
     )
     try:
         with httpx.Client(timeout=300.0, follow_redirects=True) as client:
@@ -311,7 +300,6 @@ def create_reference_image_pair_provider_job(
             "source_image_url": entry_url,
         }
     )
-    _publish_reference_images(manifest)
     manifest_path = settings.work_root / "reference_images" / job_id / "manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -319,7 +307,9 @@ def create_reference_image_pair_provider_job(
     return manifest
 
 
-def create_reference_image_pair_xingtu_job(payload: dict[str, Any]) -> dict[str, Any]:
+def create_reference_image_pair_xingtu_job(
+    payload: dict[str, Any], input_references: list[str]
+) -> dict[str, Any]:
     provider_payload = dict(payload)
     provider_payload["demo_case"] = False
     manifest = create_reference_image_pair_job(provider_payload)
@@ -330,16 +320,16 @@ def create_reference_image_pair_xingtu_job(payload: dict[str, Any]) -> dict[str,
     aspect_ratio = str(payload.get("aspect_ratio") or "9:16").strip() or "9:16"
     size = str(payload.get("image_size") or settings.xingtu_image_size).strip().upper()
 
-    entry_prompt = _station_lineart_prompt(payload["entry_prompt_zh"], "开始")
-    exit_prompt = _station_lineart_prompt(payload["exit_prompt_zh"], "结束")
-    # 星图文生图是同步返回接口，但首尾两张线稿互不依赖，
-    # 因此同一镜头内并行发起两个同步请求。
+    if not input_references:
+        raise RuntimeError("星图融合生图至少需要一张已绑定的角色、场景或道具图片")
+    entry_prompt = _station_finished_prompt(payload["entry_prompt_zh"], "开始")
+    exit_prompt = _station_finished_prompt(payload["exit_prompt_zh"], "结束")
     with ThreadPoolExecutor(max_workers=2) as pool:
         entry_future = pool.submit(
-            _call_xingtu_image, entry_prompt, model, aspect_ratio, size
+            _call_xingtu_image, entry_prompt, model, aspect_ratio, size, input_references
         )
         exit_future = pool.submit(
-            _call_xingtu_image, exit_prompt, model, aspect_ratio, size
+            _call_xingtu_image, exit_prompt, model, aspect_ratio, size, input_references
         )
         entry_data, entry_mime, entry_usage = entry_future.result()
         exit_data, exit_mime, exit_usage = exit_future.result()
@@ -351,15 +341,15 @@ def create_reference_image_pair_xingtu_job(payload: dict[str, Any]) -> dict[str,
     manifest.update(
         {
             "status": "completed",
-            "generation_strategy": "parallel_synchronous_text_to_lineart_pair",
-            "generation_mode": "xingtu_text_to_image",
+            "generation_strategy": "parallel_entry_exit_from_same_assets",
+            "generation_mode": "xingtu_image_fusion",
             "provider": "volcengine_ark",
             "image_model": model,
             "aspect_ratio": aspect_ratio,
             "size": size,
             "message": (
-                "星图文生图同步接口已直接根据开始/结束状态文本，"
-                "并行生成两张竖屏黑白站位线稿；不使用 OpenRouter，也不要求上传资产图。"
+                "星图同时以本镜头绑定的角色、场景和道具图片为参考，"
+                "并行生成全彩开始图与结束图。"
             ),
             "usage": {"entry": entry_usage, "exit": exit_usage},
         }
@@ -370,6 +360,8 @@ def create_reference_image_pair_xingtu_job(payload: dict[str, Any]) -> dict[str,
             "image_url": entry_url,
             "mime_type": entry_mime,
             "prompt_zh": entry_prompt,
+            "local_image_url": entry_url,
+            "storage": {"status": "pending_frontend_upload", "provider": "r2"},
         }
     )
     manifest["exit"].update(
@@ -378,11 +370,71 @@ def create_reference_image_pair_xingtu_job(payload: dict[str, Any]) -> dict[str,
             "image_url": exit_url,
             "mime_type": exit_mime,
             "prompt_zh": exit_prompt,
+            "local_image_url": exit_url,
+            "storage": {"status": "pending_frontend_upload", "provider": "r2"},
         }
     )
-    _publish_reference_images(manifest)
     manifest_path = settings.work_root / "reference_images" / job_id / "manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return manifest
+
+
+def create_reference_image_frame_xingtu_job(
+    payload: dict[str, Any],
+    role: str,
+    input_references: list[str],
+) -> dict[str, Any]:
+    """Generate one fused frame locally; the browser publishes it to frontend R2."""
+    if role not in {"entry", "exit"}:
+        raise RuntimeError(f"不支持的参考图角色：{role}")
+    if not input_references:
+        raise RuntimeError("融合生图至少需要一张已绑定的角色、场景或道具图片")
+
+    model = str(payload.get("image_model") or settings.xingtu_image_model).strip()
+    if not model:
+        raise RuntimeError("未配置星图 5.0 Pro 图片模型")
+    aspect_ratio = str(payload.get("aspect_ratio") or "9:16").strip() or "9:16"
+    size = str(payload.get("image_size") or settings.xingtu_image_size).strip().upper()
+    prompt_key = "entry_prompt_zh" if role == "entry" else "exit_prompt_zh"
+    state_label = "开始" if role == "entry" else "结束"
+    raw_prompt = str(payload.get(prompt_key) or "").strip()
+    if not raw_prompt:
+        raise RuntimeError(f"缺少{state_label}参考图提示词")
+    prompt = _station_finished_prompt(raw_prompt, state_label)
+
+    job_id = uuid.uuid4().hex
+    image_data, image_mime, usage = _call_xingtu_image(
+        prompt, model, aspect_ratio, size, input_references
+    )
+    local_url, image_mime = _save_generated_image(
+        job_id, role, image_data, image_mime
+    )
+    asset_id = payload.get(f"{role}_asset_id") or f"shotref::{payload['shot_id']}::{role}"
+    frame = {
+        "status": "generated_local",
+        "asset_id": asset_id,
+        "prompt_zh": prompt,
+        "image_url": local_url,
+        "local_image_url": local_url,
+        "mime_type": image_mime,
+        "storage": {"status": "pending_frontend_upload", "provider": "r2"},
+    }
+    if role == "exit" and payload.get("source_image_url"):
+        frame["source_image_url"] = payload["source_image_url"]
+    return {
+        "job_id": job_id,
+        "episode_id": payload.get("episode_id"),
+        "shot_id": payload.get("shot_id"),
+        "status": "waiting_r2_upload",
+        "generation_mode": "xingtu_manual_frame",
+        "generation_strategy": "manual_one_frame_per_request",
+        "provider": "volcengine_ark",
+        "image_model": model,
+        "aspect_ratio": aspect_ratio,
+        "size": size,
+        "generated_role": role,
+        "usage": usage,
+        role: frame,
+    }

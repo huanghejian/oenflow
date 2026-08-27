@@ -35,6 +35,11 @@ type PromptTemplateName = "asset-split" | "asset-prompts" | "storyboard-split" |
 type AssetPromptFilter = "all" | "characters" | "scenes" | "items";
 type NetworkMode = "direct" | "proxy";
 type ReferenceFrameRole = "entry" | "exit";
+type ParallelFramePreview = {
+  shotId: string;
+  role: ReferenceFrameRole;
+  manifest: ReferenceManifest;
+};
 type PromptVersion = {
   version: string;
   created_at?: string;
@@ -58,11 +63,11 @@ const EMPTY_SELECTED_PROMPT_VERSIONS: Record<PromptTemplateName, string> = {
 
 const FLOW_STEPS: Array<{ id: FlowStep; index: string; title: string; caption: string }> = [
   { id: "split", index: "01", title: "识别资产", caption: "剧本 / 资产清单" },
-  { id: "assetPrompts", index: "02", title: "资产提示词", caption: "生资产提示词" },
+  { id: "assetPrompts", index: "02", title: "资产提示词", caption: "统一上传、绑定与提示词" },
   { id: "assets", index: "03", title: "拆分镜", caption: "资产 / 分镜提示词" },
   { id: "analysis", index: "04", title: "镜头组分析", caption: "连续镜头与切镜边界" },
-  { id: "routing", index: "05", title: "路由与首尾帧", caption: "模型评分并行生图" },
-  { id: "submit", index: "06", title: "视频生成", caption: "提交分镜视频任务" },
+  { id: "routing", index: "05", title: "路由与首尾帧", caption: "路由、生图并行执行" },
+  { id: "submit", index: "06", title: "首尾帧融合", caption: "自动/手动重生 · 视频提交" },
   { id: "compose", index: "07", title: "视频合成", caption: "ffmpeg 合并分镜视频" },
   { id: "finale", index: "08", title: "终章", caption: "查看完整成片" },
 ];
@@ -471,6 +476,61 @@ async function savePromptTemplate(name: PromptTemplateName, content: string): Pr
   return data;
 }
 
+async function runWithConcurrency<T>(
+  tasks: Array<() => Promise<T>>,
+  concurrency: number,
+): Promise<PromiseSettledResult<T>[]> {
+  const results: PromiseSettledResult<T>[] = new Array(tasks.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < tasks.length) {
+      const index = cursor;
+      cursor += 1;
+      try {
+        results[index] = { status: "fulfilled", value: await tasks[index]() };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()));
+  return results;
+}
+
+function uploadMatchKey(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, "");
+}
+
+function matchUploadFileToAsset(
+  file: File,
+  cards: Array<{ asset: AssetItem }>,
+): AssetItem | null {
+  const fileKey = uploadMatchKey(file.name);
+  const ranked = cards
+    .map(({ asset }) => {
+      const idKey = uploadMatchKey(asset.id);
+      const nameKey = uploadMatchKey(asset.name);
+      const score = fileKey === idKey
+        ? 100
+        : fileKey === nameKey
+          ? 95
+          : fileKey.startsWith(idKey) || fileKey.endsWith(idKey)
+            ? 85
+            : nameKey.length >= 2 && (fileKey.includes(nameKey) || nameKey.includes(fileKey))
+              ? 70
+              : 0;
+      return { asset, score };
+    })
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score);
+  if (!ranked.length || (ranked[1] && ranked[1].score === ranked[0].score)) return null;
+  return ranked[0].asset;
+}
+
 function projectDefaults(): ProjectParams {
   return {
     episode_id: "EP001",
@@ -499,6 +559,7 @@ export default function Home() {
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
   const [networkProxyAvailable, setNetworkProxyAvailable] = useState(false);
   const [xingtuImageAvailable, setXingtuImageAvailable] = useState(false);
+  const [r2UploadAvailable, setR2UploadAvailable] = useState(false);
   const [openrouterImageAvailable, setOpenrouterImageAvailable] = useState(false);
   const [networkMode, setNetworkMode] = useState<NetworkMode>("direct");
   const [activeStep, setActiveStep] = useState<FlowStep>("split");
@@ -517,6 +578,7 @@ export default function Home() {
   const [splitResult, setSplitResult] = useState<SplitResponse | null>(null);
   const [analysisResult, setAnalysisResult] = useState<AnalysisResponse | null>(null);
   const [routeResult, setRouteResult] = useState<RouteResponse | null>(null);
+  const [parallelFramePreviews, setParallelFramePreviews] = useState<ParallelFramePreview[]>([]);
   const [submitResult, setSubmitResult] = useState<SubmitResponse | null>(null);
   const [composeResult, setComposeResult] = useState<ComposeResponse | null>(null);
   const [assetRegistry, setAssetRegistry] = useState<Record<string, AssetRecord>>({});
@@ -549,6 +611,7 @@ export default function Home() {
   const filteredAssetPromptCards = assetPromptFilter === "all" ? assetPromptCards : assetPromptCards.filter((item) => item.key === assetPromptFilter);
   const assetUrlLookup = useMemo(() => buildAssetUrlLookup(assetPromptAssets, assetRegistry), [assetPromptAssets, assetRegistry]);
   const readyAssetCount = assetPromptCards.filter((item) => assetUrlLookup[item.asset.id] || assetUrlLookup[assetLookupText(item.asset.id)]).length;
+  const allAssetsBound = assetPromptCards.length > 0 && readyAssetCount === assetPromptCards.length;
   const referenceMap = useMemo(() => {
     const map: Record<string, ReferenceManifest> = {};
     for (const manifest of routeResult?.reference_generation?.completed || []) {
@@ -658,6 +721,13 @@ export default function Home() {
         setNetworkProxyAvailable(Boolean(data.network_proxy_available));
         setXingtuImageAvailable(Boolean(data.xingtu_image_provider_available));
         setOpenrouterImageAvailable(Boolean(data.openrouter_image_provider_available));
+        try {
+          const r2Response = await fetch("/api/generated-images/status", { cache: "no-store" });
+          const r2Data = await readJson<{ available?: boolean }>(r2Response);
+          if (!cancelled) setR2UploadAvailable(Boolean(r2Response.ok && r2Data.available));
+        } catch {
+          if (!cancelled) setR2UploadAvailable(false);
+        }
       } catch {
         if (!cancelled) setBackendOnline(false);
       }
@@ -1075,15 +1145,19 @@ export default function Home() {
     return data;
   }
 
+  function applyUploadedAssetRecord(assetId: string, data: AssetRecord) {
+    setAssetResult((current) => patchAssetResponse(current, assetId, data));
+    setAssetPromptResult((current) => patchAssetResponse(current, assetId, data));
+    setSplitResult((current) => patchAssetResponse(current, assetId, data));
+  }
+
   async function uploadAsset(assetId: string, file: File) {
     resetMessages();
     setBusy(`upload:${assetId}`);
     try {
       const data = await uploadImageAssetToS3(assetId, file);
       const registeredUrl = data.public_url || data.image_url || data.url || "";
-      setAssetResult((current) => patchAssetResponse(current, assetId, data));
-      setAssetPromptResult((current) => patchAssetResponse(current, assetId, data));
-      setSplitResult((current) => patchAssetResponse(current, assetId, data));
+      applyUploadedAssetRecord(assetId, data);
       await refreshAssetRegistry();
       setNotice(`${assetId} 已上传到 S3 并绑定：${registeredUrl}`);
     } catch (caught) {
@@ -1134,6 +1208,248 @@ export default function Home() {
         delete next[progressKey];
         return next;
       });
+      setBusy("");
+    }
+  }
+
+  function mergeReferenceManifest(manifest: ReferenceManifest) {
+    setRouteResult((current) => {
+      if (!current) return current;
+      const generation = current.reference_generation || {};
+      const shotId = manifest.shot_id;
+      const existing = [
+        ...(generation.completed || []),
+        ...(generation.blocked || []),
+      ].find((item) => item.shot_id === shotId);
+      const mergedManifest: ReferenceManifest = {
+        ...existing,
+        ...manifest,
+        entry: manifest.entry || existing?.entry,
+        exit: manifest.exit || existing?.exit,
+      };
+      const completed = (generation.completed || []).filter((item) => item.shot_id !== shotId);
+      const blocked = (generation.blocked || []).filter((item) => item.shot_id !== shotId);
+      if (mergedManifest.status === "blocked") blocked.push(mergedManifest);
+      else completed.push(mergedManifest);
+      const order = new Map((current.final_video_plan?.shots || []).map((shot, index) => [shot.shot_id, index]));
+      completed.sort((left, right) => (order.get(left.shot_id) ?? 999999) - (order.get(right.shot_id) ?? 999999));
+      blocked.sort((left, right) => (order.get(left.shot_id) ?? 999999) - (order.get(right.shot_id) ?? 999999));
+      return {
+        ...current,
+        reference_generation: {
+          ...generation,
+          completed,
+          blocked,
+          completed_count: completed.length,
+          blocked_count: blocked.length,
+          generation_mode: "manual",
+        },
+      };
+    });
+  }
+
+  async function uploadAndPublishGeneratedFrame(
+    shotId: string,
+    role: ReferenceFrameRole,
+    generated: ReferenceManifest,
+    attachGeneratedFrame = false,
+  ) {
+    const frame = generated?.[role];
+    const localUrl = frame?.local_image_url || frame?.image_url;
+    if (!localUrl) throw new Error("后端未返回可上传的本地融合图");
+    const imageResponse = await fetch(isHttpUrl(localUrl) ? localUrl : `${API_BASE}${localUrl}`, { cache: "no-store" });
+    if (!imageResponse.ok) throw new Error("读取刚生成的融合图失败");
+    const imageBlob = await imageResponse.blob();
+    const r2Response = await fetch("/api/generated-images", {
+      method: "POST",
+      headers: { "Content-Type": frame?.mime_type || imageBlob.type || "image/jpeg" },
+      body: imageBlob,
+    });
+    const r2 = await readJson<{ key?: string; url?: string; detail?: string }>(r2Response);
+    if (!r2Response.ok || !r2.key || !r2.url) throw new Error(r2.detail || "前端 R2 上传失败");
+    const publishResponse = await fetch(`${API_BASE}/v1/autoflow/reference-images/publish-frame`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        shot_id: shotId,
+        role,
+        image_url: r2.url,
+        r2_key: r2.key,
+        generated_frame: attachGeneratedFrame ? frame : undefined,
+      }),
+    });
+    const published = await readJson<ReferenceManifest & { detail?: string }>(publishResponse);
+    if (!publishResponse.ok) throw new Error(published.detail || "前端 R2 图片绑定失败");
+    mergeReferenceManifest(published);
+    return published;
+  }
+
+  async function generateAndPublishReferenceFrame(shotId: string, role: ReferenceFrameRole) {
+    const existing = referenceMap[shotId];
+    const existingFrame = existing?.[role];
+    let generated = existing;
+    if (!existingFrame?.local_image_url || existingFrame.storage?.status !== "pending_frontend_upload") {
+      const response = await fetch(`${API_BASE}/v1/autoflow/reference-images/generate-frame`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          shot_id: shotId,
+          role,
+          generation_mode: "xingtu",
+          image_model: imageModel,
+        }),
+      });
+      const data = await readJson<ReferenceManifest & { detail?: string }>(response);
+      if (!response.ok) throw new Error(data.detail || "融合首尾帧生成失败");
+      mergeReferenceManifest(data);
+      generated = data;
+    }
+    if (!generated) throw new Error("融合首尾帧生成结果为空");
+    return uploadAndPublishGeneratedFrame(shotId, role, generated);
+  }
+
+  async function generateParallelDraftFrame(
+    shotGroup: (typeof shotGroups)[number],
+    shotIndex: number,
+    role: ReferenceFrameRole,
+    routeReady: Promise<RouteResponse>,
+    selectedImageModel: string,
+  ) {
+    const shotId = `u${String(shotIndex).padStart(3, "0")}`;
+    const response = await fetch(`${API_BASE}/v1/autoflow/reference-images/generate-draft-frame`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_params: projectParams,
+        assets,
+        story_context: storyContext,
+        shot_group: shotGroup,
+        shot_index: shotIndex,
+        role,
+        generation_mode: "xingtu",
+        image_model: selectedImageModel,
+      }),
+    });
+    const generated = await readJson<ReferenceManifest & { detail?: string }>(response);
+    if (!response.ok) throw new Error(generated.detail || `${shotId} 融合图生成失败`);
+    setParallelFramePreviews((current) => [
+      ...current.filter((item) => item.shotId !== shotId || item.role !== role),
+      { shotId, role, manifest: generated },
+    ]);
+
+    await routeReady;
+    mergeReferenceManifest(generated);
+    const published = await uploadAndPublishGeneratedFrame(shotId, role, generated, true);
+    setParallelFramePreviews((current) => current.filter((item) => item.shotId !== shotId || item.role !== role));
+    return published;
+  }
+
+  async function generateReferenceFrame(shotId: string, role: ReferenceFrameRole) {
+    resetMessages();
+    setBusy(`reference:${shotId}:${role}`);
+    try {
+      await generateAndPublishReferenceFrame(shotId, role);
+      await refreshAssetRegistry();
+      setNotice(`${shotId} ${role === "entry" ? "开始" : "结束"}融合图已生成并上传前端 R2。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "融合首尾帧生成失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function uploadAssetsBatch(files: File[]) {
+    if (!files.length) return;
+    resetMessages();
+    setBusy("assets-upload-batch");
+    const assignments: Array<{ asset: AssetItem; file: File }> = [];
+    const unmatched: string[] = [];
+    const assignedAssetIds = new Set<string>();
+    for (const file of files) {
+      const asset = matchUploadFileToAsset(file, assetPromptCards);
+      if (!asset || assignedAssetIds.has(asset.id)) {
+        unmatched.push(file.name);
+        continue;
+      }
+      assignedAssetIds.add(asset.id);
+      assignments.push({ asset, file });
+    }
+    try {
+      const results = await runWithConcurrency(
+        assignments.map(({ asset, file }) => async () => {
+          try {
+            const data = await uploadImageAssetToS3(asset.id, file, asset.id);
+            applyUploadedAssetRecord(asset.id, data);
+            return asset.id;
+          } finally {
+            setUploadProgress((current) => {
+              const next = { ...current };
+              delete next[asset.id];
+              return next;
+            });
+          }
+        }),
+        3,
+      );
+      const uploaded = results.filter((result) => result.status === "fulfilled").length;
+      const failed = results.length - uploaded;
+      await refreshAssetRegistry();
+      setNotice(
+        `批量资产上传完成：${uploaded} 张已绑定，失败 ${failed} 张，未匹配 ${unmatched.length} 张。`
+        + (unmatched.length ? ` 未匹配文件：${unmatched.slice(0, 5).join("、")}；请将文件名改为资产 ID 或资产名称后重试。` : ""),
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "批量上传资产失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function generateReferencePair(shotId: string) {
+    resetMessages();
+    setBusy(`reference:${shotId}:pair`);
+    try {
+      const results = await Promise.allSettled([
+        generateAndPublishReferenceFrame(shotId, "entry"),
+        generateAndPublishReferenceFrame(shotId, "exit"),
+      ]);
+      await refreshAssetRegistry();
+      const failed = results.filter((result) => result.status === "rejected");
+      if (failed.length) {
+        const detail = failed.map((result) => result.status === "rejected" && result.reason instanceof Error ? result.reason.message : "生成失败").join("；");
+        throw new Error(`${shotId} 已完成 ${2 - failed.length}/2 张：${detail}`);
+      }
+      setNotice(`${shotId} 首尾两张融合图已同时生成，并分别上传前端 R2。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "同时生成首尾融合图失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function generateAllReferenceFrames() {
+    resetMessages();
+    setBusy("references-batch");
+    try {
+      let generatedCount = 0;
+      const failures: string[] = [];
+      for (const shot of finalShots) {
+        const shotId = shotKey(shot);
+        if (!shotId) continue;
+        const results = await Promise.allSettled([
+          generateAndPublishReferenceFrame(shotId, "entry"),
+          generateAndPublishReferenceFrame(shotId, "exit"),
+        ]);
+        results.forEach((result, index) => {
+          if (result.status === "fulfilled") generatedCount += 1;
+          else failures.push(`${shotId} ${index === 0 ? "开始" : "结束"}图：${result.reason instanceof Error ? result.reason.message : "失败"}`);
+        });
+      }
+      await refreshAssetRegistry();
+      setNotice(`批量融合生图完成：${generatedCount} 张已上传前端 R2，失败 ${failures.length} 张。${failures.length ? ` ${failures.slice(0, 3).join("；")}` : ""}`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "批量融合首尾帧生成失败");
+    } finally {
       setBusy("");
     }
   }
@@ -1219,12 +1535,20 @@ export default function Home() {
       ? "doubao-seedream-5-0-pro-260628"
       : imageModel;
     resetMessages();
-    setBusy("routing");
+    setBusy("routing-parallel");
+    setParallelFramePreviews([]);
     setSubmitResult(null);
     setComposeResult(null);
+    let resolveRouteReady: (value: RouteResponse) => void = () => undefined;
+    let rejectRouteReady: (reason?: unknown) => void = () => undefined;
+    const routeReady = new Promise<RouteResponse>((resolve, reject) => {
+      resolveRouteReady = resolve;
+      rejectRouteReady = reject;
+    });
+    let parallelGeneration: Promise<PromiseSettledResult<ReferenceManifest>[]> | null = null;
     try {
       await saveCurrentPromptTemplate("routing-analysis", routingAnalysisPrompt);
-      const response = await fetch(`${API_BASE}/v1/autoflow/route-and-generate-refs`, {
+      const routeRequest = fetch(`${API_BASE}/v1/autoflow/route-and-generate-refs`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1232,24 +1556,51 @@ export default function Home() {
           assets,
           story_context: storyContext,
           shot_groups: shotGroups,
-          generation_mode: selectedGenerationMode,
+          generation_mode: selectedGenerationMode === "demo" ? "demo" : "manual",
           image_model: selectedGenerationMode !== "demo" ? selectedImageModel : undefined,
           routing_analysis_prompt: routingAnalysisPrompt,
           use_ai_difficulty: true,
           use_network_proxy: networkMode === "proxy",
         }),
       });
+      if (selectedGenerationMode === "xingtu") {
+        const frameTasks = shotGroups.flatMap((shotGroup, index) => (["entry", "exit"] as ReferenceFrameRole[]).map(
+          (role) => () => generateParallelDraftFrame(
+            shotGroup,
+            index + 1,
+            role,
+            routeReady,
+            selectedImageModel,
+          ),
+        ));
+        parallelGeneration = runWithConcurrency(frameTasks, 4);
+      }
+
+      const response = await routeRequest;
       const data = await readJson<RouteResponse>(response);
       if (!response.ok) throw new Error(data.detail || "路由或首尾帧生成失败");
       setRouteResult(data);
-      await refreshAssetRegistry();
       setActiveStep("submit");
-      const imageCount = (data.reference_generation?.completed || []).reduce(
-        (total, manifest) => total + Number(Boolean(manifest.entry?.image_url)) + Number(Boolean(manifest.exit?.image_url)),
-        0,
-      );
-      setNotice(`路由完成：${data.final_video_plan?.shots?.length || 0} 个视频镜头；首尾线稿完成 ${imageCount} 张，阻塞 ${data.reference_generation?.blocked_count || 0}。`);
+      resolveRouteReady(data);
+
+      if (parallelGeneration) {
+        setBusy("references-auto");
+        setNotice(`路由已完成：${data.final_video_plan?.shots?.length || 0} 个视频镜头；融合首尾帧仍在并行生成，完成一张就上传一张。`);
+        const frameResults = await parallelGeneration;
+        const generatedCount = frameResults.filter((result) => result.status === "fulfilled").length;
+        const failures = frameResults.filter((result) => result.status === "rejected");
+        await refreshAssetRegistry();
+        setNotice(`路由与融合生图完成：${data.final_video_plan?.shots?.length || 0} 个视频镜头，${generatedCount} 张已上传前端 R2，失败 ${failures.length} 张。`);
+      } else {
+        await refreshAssetRegistry();
+        const imageCount = (data.reference_generation?.completed || []).reduce(
+          (total, manifest) => total + Number(Boolean(manifest.entry?.image_url)) + Number(Boolean(manifest.exit?.image_url)),
+          0,
+        );
+        setNotice(`路由完成：${data.final_video_plan?.shots?.length || 0} 个视频镜头；当前已有 ${imageCount} 张参考图。`);
+      }
     } catch (caught) {
+      if (parallelGeneration) rejectRouteReady(caught);
       setError(caught instanceof Error ? caught.message : "路由或首尾帧生成失败");
     } finally {
       setBusy("");
@@ -1282,6 +1633,7 @@ export default function Home() {
       }
       const savedMode = data.reference_generation?.generation_mode;
       if (savedMode === "demo" || savedMode === "xingtu") setGenerationMode(savedMode);
+      if (savedMode === "manual") setGenerationMode("xingtu");
 
       setRouteResult(data);
       await refreshAssetRegistry();
@@ -1290,7 +1642,7 @@ export default function Home() {
         (total, manifest) => total + Number(Boolean(manifest.entry?.image_url)) + Number(Boolean(manifest.exit?.image_url)),
         0,
       );
-      setNotice(`已加载最近路由与首尾帧：${data.final_video_plan?.shots?.length || 0} 个视频镜头、${imageCount} 张首尾线稿，阻塞 ${data.reference_generation?.blocked_count || 0}。不会重复调用模型或重新生图。`);
+      setNotice(`已加载最近路由与首尾帧：${data.final_video_plan?.shots?.length || 0} 个视频镜头、${imageCount} 张全彩融合图。不会重复调用模型。`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "加载最近路由与首尾帧结果失败");
     } finally {
@@ -1557,16 +1909,16 @@ export default function Home() {
         <section className="assetCenterPage">
           <div className="assetCenterHero">
             <div>
-              <span>02 / {assetPromptCards.length} ASSETS READY</span>
+              <span>02 / {readyAssetCount}/{assetPromptCards.length} ASSETS BOUND</span>
               <h2>资产中心</h2>
-              <p>按图示卡片管理已识别资产，并通过生资产提示词模板补齐多模型提示词。</p>
+              <p>在这里一次性上传并绑定全部角色、场景和道具图片，同时补齐多模型生资产提示词。</p>
             </div>
             <div className="autoInlineActions">
               <button type="button" className="textButton" onClick={() => void loadLatestAssetPrompts()} disabled={Boolean(busy) || backendOnline !== true}>
                 {busy === "asset-prompts-load" ? "正在加载..." : "加载最近资产提示词"}
               </button>
               <button type="button" className="textButton" onClick={() => void refreshAssetRegistry()} disabled={Boolean(busy)}>刷新资产</button>
-              <button type="button" className="textButton" onClick={() => setActiveStep("assets")} disabled={!assetPromptResult}>下一步：拆分镜</button>
+              <button type="button" className="textButton" onClick={() => setActiveStep("assets")} disabled={!assetPromptResult || !allAssetsBound} title={!allAssetsBound ? "请先上传并绑定全部资产图片" : undefined}>下一步：拆分镜</button>
             </div>
           </div>
 
@@ -1587,33 +1939,66 @@ export default function Home() {
               <button type="button" className={assetPromptFilter === "scenes" ? "active" : ""} onClick={() => setAssetPromptFilter("scenes")}>场景 {assetPromptAssets.scenes.length}</button>
               <button type="button" className={assetPromptFilter === "items" ? "active" : ""} onClick={() => setAssetPromptFilter("items")}>道具 {assetPromptAssets.items.length}</button>
             </div>
-            <p><i />输出每个资产的生图提示词，供下一步拆分镜和资产生成使用。</p>
+            <p><i />图片在本步骤上传并绑定一次，后续路由与融合生图直接复用。</p>
           </div>
 
           <div className="assetCenterGrid">
             {filteredAssetPromptCards.map(({ asset, key, label, glyph }) => {
               const record = assetRegistry[asset.id];
+              const uploading = uploadProgress[asset.id] !== undefined;
+              const uploadPercent = uploadProgress[asset.id] || 0;
               const imageUrl = assetRecordUrl(record);
               return (
                 <article className={record ? "assetCenterCard bound" : "assetCenterCard"} key={`${key}:${asset.id}`}>
                   <div className="assetCenterPreview">
                     <b>{label}</b>
                     {imageUrl ? <div className="assetCenterImage" style={{ backgroundImage: `url(${imageUrl})` }} aria-label={asset.name} /> : <span>{glyph}</span>}
-                    <small>{record ? "素材已绑定" : "等待素材"}</small>
+                    <small>{uploading ? `上传 ${uploadPercent}%` : record ? "素材已绑定" : "等待素材"}</small>
+                    {uploading ? <div className="assetUploadProgress"><span style={{ width: `${uploadPercent}%` }} /></div> : null}
                   </div>
                   <div className="assetCenterCopy">
                     <strong>{asset.name}</strong>
                     <em>{asset.id}</em>
                     <p>{assetPromptPreview(asset)}</p>
                   </div>
+                  <footer>
+                    <label>
+                      <input
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp"
+                        disabled={Boolean(busy)}
+                        onChange={(event) => {
+                          const file = event.target.files?.[0];
+                          if (file) void uploadAsset(asset.id, file);
+                          event.currentTarget.value = "";
+                        }}
+                      />
+                      <span>{uploading ? `上传 ${uploadPercent}%` : record ? "替换图片" : "上传并绑定"}</span>
+                    </label>
+                    <button type="button" onClick={() => openAssetPromptPreview(asset)} disabled={!assetHasModelPrompts(asset)}>资产提示词</button>
+                  </footer>
                 </article>
               );
             })}
           </div>
 
           <div className="assetCenterActionBar">
-            <div><strong>{readyAssetCount} 个资产已配置素材</strong><span>生成提示词后可进入第 3 步拆分镜。</span></div>
+            <div><strong>{readyAssetCount}/{assetPromptCards.length} 个资产已上传并绑定</strong><span>批量文件请使用资产 ID 或资产名称命名，例如 C01.png、叶家山门.png。</span></div>
             <button className="textButton" type="button" onClick={() => void refreshAssetRegistry()} disabled={Boolean(busy)}>检查缺失资产</button>
+            <label className="textButton assetBatchUploadButton">
+              <input
+                type="file"
+                multiple
+                accept="image/png,image/jpeg,image/webp"
+                disabled={Boolean(busy)}
+                onChange={(event) => {
+                  const files = Array.from(event.target.files || []);
+                  if (files.length) void uploadAssetsBatch(files);
+                  event.currentTarget.value = "";
+                }}
+              />
+              <span>{busy === "assets-upload-batch" ? "批量上传中..." : "批量上传全部资产"}</span>
+            </label>
             <button className="generateButton" type="button" onClick={() => void runAssetPrompts()} disabled={Boolean(busy) || !assetResult || backendOnline !== true || !assetPromptGenerationPrompt.trim()}>
               <span>{busy === "asset-prompts" ? "正在生成生资产提示词..." : "确认资产并生成提示词"}</span><b>→</b>
             </button>
@@ -1627,9 +2012,9 @@ export default function Home() {
         <section className="assetCenterPage">
           <div className="assetCenterHero">
             <div>
-              <span>03 / {assetPromptCards.length} ASSETS PROMPTED</span>
+              <span>03 / {readyAssetCount}/{assetPromptCards.length} ASSETS BOUND</span>
               <h2>资产提示词确认</h2>
-              <p>检查每个资产的提示词结果，再基于拆分镜模板生成分镜与子镜头。</p>
+              <p>这里只确认已绑定资产及提示词，不再重复上传；确认后生成分镜与子镜头。</p>
             </div>
             <div className="autoInlineActions">
               <button type="button" className="textButton" onClick={() => void loadLatestStoryboard()} disabled={Boolean(busy) || backendOnline !== true}>
@@ -1657,42 +2042,26 @@ export default function Home() {
               <button type="button" className={assetPromptFilter === "scenes" ? "active" : ""} onClick={() => setAssetPromptFilter("scenes")}>场景 {assetPromptAssets.scenes.length}</button>
               <button type="button" className={assetPromptFilter === "items" ? "active" : ""} onClick={() => setAssetPromptFilter("items")}>道具 {assetPromptAssets.items.length}</button>
             </div>
-            <p><i />点击“资产提示词”查看该资产的三套候选，确认后进入拆分镜。</p>
+            <p><i />资产图片已在上一步统一绑定；此处只读确认提示词和绑定状态。</p>
           </div>
 
           <div className="assetCenterGrid">
             {filteredAssetPromptCards.map(({ asset, key, label, glyph }) => {
               const record = assetRegistry[asset.id];
-              const uploading = busy === `upload:${asset.id}`;
-              const uploadPercent = uploadProgress[asset.id] || 0;
               const imageUrl = assetRecordUrl(record);
               return (
                 <article className={record ? "assetCenterCard bound" : "assetCenterCard"} key={`storyboard:${key}:${asset.id}`}>
                   <div className="assetCenterPreview">
                     <b>{label}</b>
                     {imageUrl ? <div className="assetCenterImage" style={{ backgroundImage: `url(${imageUrl})` }} aria-label={asset.name} /> : <span>{glyph}</span>}
-                    <small>{uploading ? `上传 ${uploadPercent}%` : record ? "素材已绑定" : "等待素材"}</small>
-                    {uploading ? <div className="assetUploadProgress"><span style={{ width: `${uploadPercent}%` }} /></div> : null}
+                    <small>{record ? "素材已绑定" : "返回上一步补传"}</small>
                   </div>
                   <div className="assetCenterCopy">
                     <strong>{asset.name}</strong>
                     <em>{asset.id}</em>
                     <p>{assetPromptPreview(asset)}</p>
                   </div>
-                  <footer>
-                    <label>
-                      <input
-                        type="file"
-                        accept="image/png,image/jpeg,image/webp"
-                        disabled={Boolean(busy)}
-                        onChange={(event) => {
-                          const file = event.target.files?.[0];
-                          if (file) uploadAsset(asset.id, file);
-                          event.currentTarget.value = "";
-                        }}
-                      />
-                      <span>{uploading ? `上传 ${uploadPercent}%` : record ? "替换图片" : "上传图片"}</span>
-                    </label>
+                  <footer className="readonly">
                     <button type="button" onClick={() => openAssetPromptPreview(asset)} disabled={!assetHasModelPrompts(asset)}>资产提示词</button>
                   </footer>
                 </article>
@@ -1701,9 +2070,9 @@ export default function Home() {
           </div>
 
           <div className="assetCenterActionBar">
-            <div><strong>{readyAssetCount} 个资产已配置素材</strong><span>资产提示词确认后，可提交拆分镜大模型分析。</span></div>
-            <button className="textButton" type="button" onClick={() => void refreshAssetRegistry()} disabled={Boolean(busy)}>检查缺失资产</button>
-            <button className="generateButton" type="button" onClick={() => void runStoryboardSplit()} disabled={Boolean(busy) || !assetPromptResult || backendOnline !== true}>
+            <div><strong>{readyAssetCount}/{assetPromptCards.length} 个资产已绑定</strong><span>{allAssetsBound ? "无需再次上传，可直接提交拆分镜。" : "仍有缺失资产，请返回第 2 步资产中心补传。"}</span></div>
+            {!allAssetsBound ? <button className="textButton" type="button" onClick={() => setActiveStep("assetPrompts")}>返回资产中心补传</button> : null}
+            <button className="generateButton" type="button" onClick={() => void runStoryboardSplit()} disabled={Boolean(busy) || !assetPromptResult || backendOnline !== true || !allAssetsBound}>
               <span>{busy === "storyboard-split" ? "正在拆分镜..." : "基于资产拆分镜"}</span><b>→</b>
             </button>
           </div>
@@ -1799,14 +2168,14 @@ export default function Home() {
               <div className="routingTemplateOptions">
                 <select value={generationMode} onChange={(event) => selectImageGenerationMode(event.target.value as GenerationMode)}>
                   <option value="demo">Demo 占位图</option>
-                  <option value="xingtu">星图 5.0 Pro（真实）</option>
+                  <option value="xingtu">星图 5.0 Pro 融合生图（真实）</option>
                 </select>
                 <input value={imageModel} onChange={(event) => setImageModel(event.target.value)} disabled={generationMode === "demo"} />
                 <span className={`imageProviderState ${generationMode !== "demo" && ((generationMode === "xingtu" && xingtuImageAvailable) || (generationMode === "openrouter" && openrouterImageAvailable)) ? "ready" : ""}`}>
                   {generationMode === "demo"
                     ? "占位图 · 9:16"
                     : generationMode === "xingtu"
-                      ? `${xingtuImageAvailable ? "已配置" : "密钥未配置"} · 同步文生图 · 首尾并行 · 2K · 9:16 · ${shotGroups.length * 2} 张线稿`
+                      ? `${xingtuImageAvailable ? "图片模型已配置" : "图片模型未配置"} · ${r2UploadAvailable ? "前端 R2 已就绪" : "前端 R2 未就绪"} · 路由与融合生图并行 · 2K · 9:16`
                       : `${openrouterImageAvailable ? "已配置" : "密钥未配置"} · 9:16`}
                 </span>
                 <button
@@ -1828,11 +2197,12 @@ export default function Home() {
                   Boolean(busy)
                   || !analysisResult
                   || !routingAnalysisPrompt.trim()
-                  || (generationMode === "xingtu" && !xingtuImageAvailable)
-                  || (generationMode === "openrouter" && !openrouterImageAvailable)
+                  || !allAssetsBound
+                  || (generationMode === "xingtu" && (!xingtuImageAvailable || !r2UploadAvailable))
                 }
+                title={!allAssetsBound ? "请先在资产提示词页上传并绑定全部资产图片" : undefined}
               >
-                <span>{busy === "routing" ? "路由与生图中..." : generationMode === "demo" ? "执行路由 + 占位图" : `执行路由 + 生成 ${shotGroups.length * 2} 张线稿`}</span><b>→</b>
+                <span>{busy === "routing-parallel" ? "路由与融合生图并行启动中..." : generationMode === "demo" ? "执行路由 + 占位图" : "并行执行路由 + 融合首尾帧"}</span><b>→</b>
               </button>
               <button
                 type="button"
@@ -1843,6 +2213,26 @@ export default function Home() {
                 {busy === "routing-load" ? "加载中..." : "加载最近路由与首尾帧"}
               </button>
             </div>
+            {parallelFramePreviews.length > 0 && (
+              <section className="parallelFramePreview" aria-live="polite">
+                <div>
+                  <strong>融合图实时返回</strong>
+                  <span>已完成 {parallelFramePreviews.length} 张，路由结束后自动上传前端 R2</span>
+                </div>
+                <div className="parallelFramePreviewGrid">
+                  {parallelFramePreviews.map(({ shotId, role, manifest }) => {
+                    const frame = manifest[role];
+                    const imageUrl = frame?.local_image_url || frame?.image_url;
+                    return imageUrl ? (
+                      <figure key={`${shotId}:${role}`}>
+                        <img src={displayImageUrl(imageUrl)} alt={`${shotId} ${role === "entry" ? "首帧" : "尾帧"}`} />
+                        <figcaption>{shotId} · {role === "entry" ? "首帧" : "尾帧"}</figcaption>
+                      </figure>
+                    ) : null;
+                  })}
+                </div>
+              </section>
+            )}
           </div>
           {analysisResult && (
             <section className="card">
@@ -1878,8 +2268,16 @@ export default function Home() {
         <section className="assetCenterPage">
           <section className="card autoFullCard">
           <div className="cardHead">
-            <div><span>06</span><div><h2>视频生成</h2><p>提交镜头组路由方案、首尾帧图片、资产图片和分镜提示词，等待每个分镜视频输出。</p></div></div>
+            <div><span>06</span><div><h2>首尾帧融合生图</h2><p>路由时已自动并行生成；这里可查看逐张上传结果，也可手动重生单张或批量补生。</p></div></div>
             <div className="autoInlineActions submitRouteActions">
+              <button
+                type="button"
+                className="textButton"
+                onClick={() => void generateAllReferenceFrames()}
+                disabled={Boolean(busy) || !routeResult?.final_video_plan || !xingtuImageAvailable || !r2UploadAvailable}
+              >
+                {busy === "references-batch" ? "逐张融合并上传中..." : "批量生成全部首尾帧"}
+              </button>
               <button
                 type="button"
                 className="textButton"
@@ -1887,13 +2285,40 @@ export default function Home() {
                 disabled={Boolean(busy) || hasActiveVideoJobs || !routeResult?.final_video_plan || generatedReferenceImageCount < finalShots.length * 2 || hasSubmitMissingAssets}
                 title={hasActiveVideoJobs ? "已有视频任务生成中，请等待完成后再批量生成" : hasSubmitMissingAssets ? "存在缺失素材的镜头，需补齐后才能批量生成" : undefined}
               >
-                {busy === "submit" ? "批量生成中..." : "批量生成"}
+                {busy === "submit" ? "视频批量生成中..." : "批量生成视频"}
               </button>
             </div>
+            {parallelFramePreviews.length > 0 && (
+              <section className="parallelFramePreview" aria-live="polite">
+                <div>
+                  <strong>融合图实时返回</strong>
+                  <span>已完成 {parallelFramePreviews.length} 张，路由结束后自动上传前端 R2</span>
+                </div>
+                <div className="parallelFramePreviewGrid">
+                  {parallelFramePreviews.map(({ shotId, role, manifest }) => {
+                    const frame = manifest[role];
+                    const imageUrl = frame?.local_image_url || frame?.image_url;
+                    return imageUrl ? (
+                      <figure key={`${shotId}:${role}`}>
+                        <img src={displayImageUrl(imageUrl)} alt={`${shotId} ${role === "entry" ? "首帧" : "尾帧"}`} />
+                        <figcaption>{shotId} · {role === "entry" ? "首帧" : "尾帧"}</figcaption>
+                      </figure>
+                    ) : null;
+                  })}
+                </div>
+              </section>
+            )}
+          </div>
+          <div className={`r2GenerationNotice ${r2UploadAvailable ? "ready" : "blocked"}`}>
+            <div>
+              <strong>{r2UploadAvailable ? "前端 R2 图片桶已就绪" : "前端 R2 图片桶尚未就绪"}</strong>
+              <span>{r2UploadAvailable ? "开始图与结束图都融合本镜头所需的角色、场景和道具图片，可单张生成，也可同时生成。" : "请确认前端 Worker 已加载 GENERATED_IMAGES R2 绑定，然后刷新页面。"}</span>
+            </div>
+            <b>{r2UploadAvailable ? "全彩融合 · 非线稿" : "生图已锁定"}</b>
           </div>
           <div className="submitSummary">
             <div><small>视频镜头</small><strong>{finalShots.length}</strong></div>
-            <div><small>首尾线稿</small><strong>{generatedReferenceImageCount}/{finalShots.length * 2}</strong></div>
+            <div><small>首尾融合图</small><strong>{generatedReferenceImageCount}/{finalShots.length * 2}</strong></div>
             <div><small>视频入队</small><strong>{submitResult?.submitted_count || 0}</strong></div>
             <div><small>阻塞</small><strong>{submitResult?.blocked_count || routeResult?.reference_generation?.blocked_count || 0}</strong></div>
           </div>
@@ -1904,11 +2329,10 @@ export default function Home() {
               const route = routingShots.find((item) => item.shot_id === shotLabel || item.source_group === shotLabel);
               const hasActiveShotJob = activeVideoShotIds.has(shotLabel);
               const isShotSubmitting = busy === `submit:${shotLabel}` || hasActiveShotJob;
+              const isPairGenerating = busy === `reference:${shotLabel}:pair`;
               const hasReferencePair = Boolean(manifest?.entry?.image_url && manifest?.exit?.image_url);
               const missingAssets = submitMissingAssetsByShot[shotLabel] || [];
               const canGenerateShot = Boolean(routeResult?.final_video_plan) && hasReferencePair && missingAssets.length === 0 && !hasActiveShotJob;
-              const entryAssetId = manifest?.entry?.asset_id || shot.reference_image_plan?.output_asset_ids?.entry;
-              const exitAssetId = manifest?.exit?.asset_id || shot.reference_image_plan?.output_asset_ids?.exit;
               return (
                 <article className="submitVideoCard" key={shotLabel}>
                   <header className="submitVideoCardHead">
@@ -1926,6 +2350,19 @@ export default function Home() {
                           disabled={!route}
                         >
                           分析详情
+                        </button>
+                        {missingAssets.length ? (
+                          <button type="button" className="quiet-button" onClick={() => setActiveStep("assetPrompts")}>
+                            返回资产中心补传
+                          </button>
+                        ) : null}
+                        <button
+                          type="button"
+                          className="quiet-button"
+                          onClick={() => void generateReferencePair(shotLabel)}
+                          disabled={Boolean(busy) || !xingtuImageAvailable || !r2UploadAvailable || missingAssets.length > 0}
+                        >
+                          {isPairGenerating ? "首尾生成中..." : "同时生成首尾图"}
                         </button>
                         <button
                           type="button"
@@ -1951,13 +2388,16 @@ export default function Home() {
                     manifest={manifest}
                     plan={shot.reference_image_plan}
                     apiBase={API_BASE}
-                    isGenerating={busy === "routing" || busy === "references"}
-                    uploadProgress={{
-                      entry: entryAssetId ? uploadProgress[entryAssetId] : undefined,
-                      exit: exitAssetId ? uploadProgress[exitAssetId] : undefined,
-                    }}
-                    uploadDisabled={Boolean(busy)}
-                    onUploadFrame={(role) => void uploadReferenceFrame(shot, role)}
+                    isGenerating={isPairGenerating}
+                    generatingRole={
+                      busy === `reference:${shotLabel}:entry`
+                        ? "entry"
+                        : busy === `reference:${shotLabel}:exit`
+                          ? "exit"
+                          : undefined
+                    }
+                    onGenerate={(role) => void generateReferenceFrame(shotLabel, role)}
+                    generationEnabled={!busy && generationMode === "xingtu" && xingtuImageAvailable && r2UploadAvailable && missingAssets.length === 0}
                     compact
                   />
                   <footer>

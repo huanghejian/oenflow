@@ -16,6 +16,7 @@ from .executor_binding import bind_logical_assets
 
 WORKFLOW_ROOT = settings.work_root / "demo_workflow"
 WORKFLOW_UPLOAD_ROOT = WORKFLOW_ROOT / "uploads"
+WORKFLOW_GENERATED_ROOT = WORKFLOW_ROOT / "generated"
 WORKFLOW_VIDEO_JOB_ROOT = WORKFLOW_ROOT / "video_jobs"
 WORKFLOW_VIDEO_OUTPUT_ROOT = WORKFLOW_ROOT / "video_outputs"
 WORKFLOW_REGISTRY_PATH = WORKFLOW_ROOT / "asset_registry.json"
@@ -64,6 +65,18 @@ def register_binding(asset_id: str, binding: dict[str, Any]) -> dict[str, Any]:
         registry[normalized] = record
         _save_registry_unlocked(registry)
     return record
+
+
+def remove_binding(asset_id: str) -> bool:
+    normalized = str(asset_id or "").strip()
+    if not normalized:
+        return False
+    with _registry_lock:
+        registry = _load_registry_unlocked()
+        removed = registry.pop(normalized, None) is not None
+        if removed:
+            _save_registry_unlocked(registry)
+    return removed
 
 
 def _image_extension(content_type: str, data: bytes) -> tuple[str, str]:
@@ -203,8 +216,6 @@ def seed_demo_assets() -> dict[str, Any]:
 
 
 def register_reference_pair(manifest: dict[str, Any]) -> dict[str, Any]:
-    from .s3_asset_service import publish_image_asset
-
     registered = []
     for key in ("entry", "exit"):
         item = manifest.get(key) or {}
@@ -212,8 +223,18 @@ def register_reference_pair(manifest: dict[str, Any]) -> dict[str, Any]:
         image_url = item.get("image_url")
         if not asset_id or not image_url:
             continue
-        published = (
-            {
+        storage = item.get("storage") or {}
+        if storage.get("status") == "pending_frontend_upload":
+            continue
+        frontend_r2 = storage.get("provider") == "cloudflare-r2"
+        if frontend_r2:
+            published = {
+                "url": str(image_url),
+                "public_url": str(image_url),
+                "local_url": str(item.get("local_image_url") or item.get("local_url") or ""),
+            }
+        elif item.get("s3_key"):
+            published = {
                 "url": str(image_url),
                 "public_url": str(item.get("public_url") or image_url),
                 "s3_key": str(item["s3_key"]),
@@ -223,9 +244,9 @@ def register_reference_pair(manifest: dict[str, Any]) -> dict[str, Any]:
                     else {}
                 ),
             }
-            if item.get("s3_key")
-            else publish_image_asset(str(image_url))
-        )
+        else:
+            from .s3_asset_service import publish_image_asset
+            published = publish_image_asset(str(image_url))
         item.update(published)
         item["image_url"] = published["url"]
         registered.append(
@@ -244,16 +265,14 @@ def register_reference_pair(manifest: dict[str, Any]) -> dict[str, Any]:
                     "s3_key": published.get("s3_key"),
                     "media_type": "image",
                     "mime_type": item.get("mime_type") or "image/png",
-                    "source": "derived_reference_image_s3",
+                    "source": "derived_reference_image_r2" if frontend_r2 else "derived_reference_image_s3",
                     "shot_id": manifest.get("shot_id"),
                     "generated_role": key,
                     "ordinary_image_reference": True,
+                    "storage": storage,
                 },
             )
         )
-    entry_url = (manifest.get("entry") or {}).get("image_url")
-    if entry_url and isinstance(manifest.get("exit"), dict):
-        manifest["exit"]["source_image_url"] = entry_url
     job_id = str(manifest.get("job_id") or "").strip()
     if job_id:
         manifest_path = settings.work_root / "reference_images" / job_id / "manifest.json"
@@ -276,6 +295,7 @@ def asset_reference_data_urls(asset_ids: list[str]) -> list[str]:
         registry = _load_registry_unlocked()
     roots = {
         "/workflow-assets/": WORKFLOW_UPLOAD_ROOT,
+        "/workflow-generated/": WORKFLOW_GENERATED_ROOT,
         "/demo-input-assets/": DEMO_INPUT_ASSET_ROOT,
         "/demo-assets/": DEMO_REFERENCE_ASSET_ROOT,
     }
@@ -285,6 +305,9 @@ def asset_reference_data_urls(asset_ids: list[str]) -> list[str]:
         if not binding:
             raise ValueError(f"图片资产尚未绑定：{asset_id}")
         url = str(binding.get("local_url") or binding.get("url") or "")
+        if urllib.parse.urlsplit(url).scheme in {"http", "https"}:
+            references.append(url)
+            continue
         root = next((value for prefix, value in roots.items() if url.startswith(prefix)), None)
         prefix = next((value for value in roots if url.startswith(value)), None)
         if root is None or prefix is None:

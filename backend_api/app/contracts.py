@@ -76,7 +76,7 @@ class ReferenceImageFromShotRequest(BaseModel):
     episode_id: str = Field(min_length=1)
     shot: dict[str, Any]
     demo_case: bool = True
-    generation_mode: Literal["demo", "provider", "openrouter", "xingtu"] = "demo"
+    generation_mode: Literal["demo", "manual", "provider", "openrouter", "xingtu"] = "demo"
     image_model: str | None = Field(default=None, min_length=1, max_length=200)
 
 
@@ -181,7 +181,7 @@ class AutoFlowRouteRequest(BaseModel):
     assets: dict[str, Any] = Field(default_factory=dict)
     story_context: dict[str, Any] = Field(default_factory=dict)
     shot_groups: list[dict[str, Any]]
-    generation_mode: Literal["demo", "provider", "openrouter", "xingtu"] = "demo"
+    generation_mode: Literal["demo", "manual", "provider", "openrouter", "xingtu"] = "demo"
     image_model: str | None = Field(default=None, min_length=1, max_length=200)
     routing_analysis_prompt: str = Field(
         default="请逐镜头评估真实生成难度和能力需求，禁止直接选择模型。",
@@ -196,6 +196,32 @@ class AutoFlowReferenceRegenerateRequest(BaseModel):
     generation_mode: Literal["demo", "xingtu"] = "xingtu"
     image_model: str | None = Field(default=None, min_length=1, max_length=200)
     shot_ids: list[str] = Field(default_factory=list)
+
+
+class AutoFlowReferenceFrameGenerateRequest(BaseModel):
+    shot_id: str = Field(min_length=1, max_length=200)
+    role: Literal["entry", "exit"]
+    generation_mode: Literal["xingtu"] = "xingtu"
+    image_model: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class AutoFlowReferenceDraftFrameGenerateRequest(BaseModel):
+    project_params: AutoFlowProjectParams = Field(default_factory=AutoFlowProjectParams)
+    assets: dict[str, Any] = Field(default_factory=dict)
+    story_context: dict[str, Any] = Field(default_factory=dict)
+    shot_group: dict[str, Any]
+    shot_index: int = Field(ge=1, le=10_000)
+    role: Literal["entry", "exit"]
+    generation_mode: Literal["xingtu"] = "xingtu"
+    image_model: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class AutoFlowReferenceFramePublishRequest(BaseModel):
+    shot_id: str = Field(min_length=1, max_length=200)
+    role: Literal["entry", "exit"]
+    image_url: str = Field(min_length=8, max_length=4000)
+    r2_key: str = Field(min_length=1, max_length=1000)
+    generated_frame: dict[str, Any] | None = None
 
 
 class AutoFlowSubmitRequest(BaseModel):

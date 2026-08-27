@@ -1,6 +1,6 @@
 export type FlowStep = "split" | "assetPrompts" | "assets" | "analysis" | "routing" | "submit" | "compose" | "finale";
 export type RoutingTier = "low" | "medium" | "high";
-export type GenerationMode = "demo" | "openrouter" | "xingtu";
+export type GenerationMode = "demo" | "manual" | "openrouter" | "xingtu";
 
 export type ProjectParams = {
   episode_id: string;
@@ -275,9 +275,19 @@ export type ReferenceManifest = {
   aspect_ratio?: string;
   size?: string;
   input_asset_ids?: string[];
+  input_asset_bindings?: Array<{
+    asset_id?: string;
+    asset_type?: string;
+    purpose?: string;
+    required?: boolean;
+    binding_status?: string;
+    url?: string;
+    source?: string;
+    original_filename?: string;
+  }>;
   missing_asset_ids?: string[];
-  entry?: { asset_id?: string; image_url?: string; url?: string; public_url?: string; s3_key?: string; prompt_zh?: string; status?: string };
-  exit?: { asset_id?: string; image_url?: string; url?: string; public_url?: string; s3_key?: string; prompt_zh?: string; status?: string };
+  entry?: { asset_id?: string; image_url?: string; local_image_url?: string; url?: string; public_url?: string; s3_key?: string; prompt_zh?: string; status?: string; mime_type?: string; storage?: { status?: string; provider?: string; key?: string; url?: string } };
+  exit?: { asset_id?: string; image_url?: string; local_image_url?: string; url?: string; public_url?: string; s3_key?: string; prompt_zh?: string; status?: string; mime_type?: string; storage?: { status?: string; provider?: string; key?: string; url?: string } };
 };
 
 export type RouteResponse = {
