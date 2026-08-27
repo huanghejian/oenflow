@@ -145,8 +145,9 @@ export default function ReferenceFrameSlots({
         })}
       </div>
       {preview ? (
-        <div className="framePreviewModalBackdrop" role="presentation" onClick={() => setPreview(null)}>
-          <section className="framePreviewModal" role="dialog" aria-modal="true" aria-label={preview.title} onClick={(event) => event.stopPropagation()}>
+        <div className="framePreviewModalBackdrop">
+          <button className="framePreviewModalCloseLayer" type="button" aria-label="关闭图片预览" onClick={() => setPreview(null)} />
+          <section className="framePreviewModal" role="dialog" aria-modal="true" aria-label={preview.title}>
             <header>
               <strong>{preview.title}</strong>
               <button type="button" onClick={() => setPreview(null)}>关闭</button>

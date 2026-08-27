@@ -3089,12 +3089,22 @@ textarea:focus {
   backdrop-filter:blur(8px);
 }
 
+.framePreviewModalCloseLayer {
+  position:absolute;
+  inset:0;
+  border:0;
+  background:transparent;
+  cursor:default;
+}
+
 .framePreviewModal {
   width:min(92vw, 1100px);
   height:min(92vh, 1040px);
   overflow:hidden;
   display:flex;
   flex-direction:column;
+  position:relative;
+  z-index:1;
   border:1px solid rgba(255,255,255,.16);
   border-radius:16px;
   background:#15131b;
