@@ -30,7 +30,7 @@ import type {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
 const VIDEO_POLL_MS = 10_000;
-const ACTIVE_VIDEO_STATUSES = new Set(["queued", "submitting", "running"]);
+const ACTIVE_VIDEO_STATUSES = new Set(["pending", "queued", "submitting", "running"]);
 type PromptTemplateName = "asset-split" | "asset-prompts" | "storyboard-split" | "shot-group-analysis" | "routing-analysis";
 type AssetPromptFilter = "all" | "characters" | "scenes" | "items";
 type NetworkMode = "direct" | "proxy";
@@ -525,6 +525,7 @@ export default function Home() {
   const [assetPromptPreviewAsset, setAssetPromptPreviewAsset] = useState<AssetItem | null>(null);
   const [assetPromptPreviewVariant, setAssetPromptPreviewVariant] = useState("");
   const [routingDetailShotId, setRoutingDetailShotId] = useState<string | null>(null);
+  const [submitDetailShotId, setSubmitDetailShotId] = useState("");
   const [generationMode, setGenerationMode] = useState<GenerationMode>("xingtu");
   const [imageModel, setImageModel] = useState("doubao-seedream-5-0-pro-260628");
   const [busy, setBusy] = useState("");
@@ -583,6 +584,9 @@ export default function Home() {
     if (!routingDetailShotId) return undefined;
     return finalShots.find((shot) => shot.shot_id === routingDetailShotId || shot.group_id === routingDetailShotId);
   }, [finalShots, routingDetailShotId]);
+  const selectedSubmitShot = useMemo(() => {
+    return finalShots.find((shot) => shotKey(shot) === submitDetailShotId) || finalShots[0];
+  }, [finalShots, submitDetailShotId]);
   const completedSteps = useMemo(() => {
     const done = new Set<FlowStep>();
     if (assetResult) done.add("split");
@@ -609,6 +613,10 @@ export default function Home() {
     }
     return shotIds;
   }, [submitResult]);
+  const videoJobs = useMemo(() => submitResult?.jobs || [], [submitResult]);
+  const selectedComposeJob = useMemo(() => {
+    return videoJobs.find((job) => (job.shot_id || job.job_id || "") === submitDetailShotId) || videoJobs[0];
+  }, [submitDetailShotId, videoJobs]);
   useEffect(() => {
     if (!pollingBatchId || !hasActiveVideoJobs) return;
 
@@ -1475,10 +1483,30 @@ export default function Home() {
           {activeStep !== "assetPrompts" && activeStep !== "assets" && (
             <div className="assetCenterHero autoStepHero">
               <div>
-                <span>{currentStep.index} / 07 AUTOFLOW</span>
+                <span>{currentStep.index} / {FLOW_STEPS.length.toString().padStart(2, "0")} AUTOFLOW</span>
                 <h2>{currentStep.title}</h2>
                 <p>{currentStep.caption}</p>
               </div>
+              {activeStep === "analysis" && (
+                <button
+                  type="button"
+                  className="textButton autoHeroAction"
+                  onClick={() => void loadLatestAnalysis()}
+                  disabled={Boolean(busy) || backendOnline !== true}
+                >
+                  {busy === "analysis-load" ? "正在加载..." : "加载最近镜头组分析"}
+                </button>
+              )}
+              {activeStep === "routing" && (
+                <button
+                  type="button"
+                  className="textButton autoHeroAction"
+                  onClick={() => void loadLatestRoutingAndReferences("submit")}
+                  disabled={Boolean(busy) || backendOnline !== true}
+                >
+                  {busy === "routing-load" ? "加载中..." : "加载最近路由与首尾帧"}
+                </button>
+              )}
               {activeStep === "submit" && (
                 <button
                   type="button"
@@ -1489,10 +1517,28 @@ export default function Home() {
                   {busy === "video-batch-load" ? "加载中..." : "加载视频列表"}
                 </button>
               )}
-              <div className="autoHeroStats">
-                <span><b>{segments.length}</b> 分镜</span>
-                <span><b>{shotGroups.length}</b> 镜头组</span>
-                <span><b>{finalShots.length}</b> 视频镜头</span>
+              <div className={activeStep === "submit" || activeStep === "compose" ? "autoHeroStats videoHeroStats" : "autoHeroStats"}>
+                {activeStep === "submit" ? (
+                  <>
+                    <span><b>{finalShots.length}</b> 视频镜头</span>
+                    <span><b>{generatedReferenceImageCount}/{finalShots.length * 2}</b> 首尾线稿</span>
+                    <span><b>{submitResult?.submitted_count || 0}</b> 视频入队</span>
+                    <span><b>{submitResult?.blocked_count || routeResult?.reference_generation?.blocked_count || 0}</b> 阻塞</span>
+                  </>
+                ) : activeStep === "compose" ? (
+                  <>
+                    <span><b>{videoJobs.length}</b> 视频任务</span>
+                    <span><b>{composableVideoCount(submitResult)}</b> 可合成</span>
+                    <span><b>{composeResult?.blocked_count || 0}</b> 合成阻塞</span>
+                    <span><b>{composeResult?.status || "待合成"}</b> 状态</span>
+                  </>
+                ) : (
+                  <>
+                    <span><b>{segments.length}</b> 分镜</span>
+                    <span><b>{shotGroups.length}</b> 镜头组</span>
+                    <span><b>{finalShots.length}</b> 视频镜头</span>
+                  </>
+                )}
               </div>
             </div>
           )}
@@ -1769,9 +1815,6 @@ export default function Home() {
                 <button className="generateButton autoPrimaryButton" type="button" onClick={() => void runAnalysis()} disabled={Boolean(busy) || !splitResult}>
                   <span>{busy === "analysis" ? "正在分析镜头组..." : "分析镜头组"}</span><b>→</b>
                 </button>
-                <button className="textButton" type="button" onClick={() => void loadLatestAnalysis()} disabled={Boolean(busy) || backendOnline !== true}>
-                  {busy === "analysis-load" ? "正在加载..." : "加载最近镜头组分析"}
-                </button>
               </div>
             </div>
             <section className="card">
@@ -1834,14 +1877,6 @@ export default function Home() {
               >
                 <span>{busy === "routing" ? "路由与生图中..." : generationMode === "demo" ? "执行路由 + 占位图" : `执行路由 + 生成 ${shotGroups.length * 2} 张线稿`}</span><b>→</b>
               </button>
-              <button
-                type="button"
-                className="textButton"
-                onClick={() => void loadLatestRoutingAndReferences("submit")}
-                disabled={Boolean(busy) || backendOnline !== true}
-              >
-                {busy === "routing-load" ? "加载中..." : "加载最近路由与首尾帧"}
-              </button>
             </div>
           </div>
           {analysisResult && (
@@ -1875,103 +1910,127 @@ export default function Home() {
       )}
 
       {activeStep === "submit" && (
-        <section className="assetCenterPage">
-          <section className="card autoFullCard">
+        <section className="assetCenterPage submitGenerationPage">
+          <section className="card autoFullCard submitGenerationToolbar">
           <div className="cardHead">
             <div><span>06</span><div><h2>视频生成</h2><p>提交镜头组路由方案、首尾帧图片、资产图片和分镜提示词，等待每个分镜视频输出。</p></div></div>
             <div className="autoInlineActions submitRouteActions">
               <button
                 type="button"
-                className="textButton"
+                className="generateButton autoPrimaryButton"
                 onClick={() => void runSubmit()}
                 disabled={Boolean(busy) || hasActiveVideoJobs || !routeResult?.final_video_plan || generatedReferenceImageCount < finalShots.length * 2 || hasSubmitMissingAssets}
                 title={hasActiveVideoJobs ? "已有视频任务生成中，请等待完成后再批量生成" : hasSubmitMissingAssets ? "存在缺失素材的镜头，需补齐后才能批量生成" : undefined}
               >
-                {busy === "submit" ? "批量生成中..." : "批量生成"}
+                <span>{busy === "submit" ? "批量生成中..." : "批量生成"}</span><b>→</b>
               </button>
             </div>
           </div>
-          <div className="submitSummary">
-            <div><small>视频镜头</small><strong>{finalShots.length}</strong></div>
-            <div><small>首尾线稿</small><strong>{generatedReferenceImageCount}/{finalShots.length * 2}</strong></div>
-            <div><small>视频入队</small><strong>{submitResult?.submitted_count || 0}</strong></div>
-            <div><small>阻塞</small><strong>{submitResult?.blocked_count || routeResult?.reference_generation?.blocked_count || 0}</strong></div>
-          </div>
-          <div className="submitShotList">
-            {finalShots.map((shot) => {
-              const shotLabel = shotKey(shot);
-              const manifest = referenceMap[shotLabel];
-              const route = routingShots.find((item) => item.shot_id === shotLabel || item.source_group === shotLabel);
-              const hasActiveShotJob = activeVideoShotIds.has(shotLabel);
-              const isShotSubmitting = busy === `submit:${shotLabel}` || hasActiveShotJob;
-              const hasReferencePair = Boolean(manifest?.entry?.image_url && manifest?.exit?.image_url);
-              const missingAssets = submitMissingAssetsByShot[shotLabel] || [];
-              const canGenerateShot = Boolean(routeResult?.final_video_plan) && hasReferencePair && missingAssets.length === 0 && !hasActiveShotJob;
-              const entryAssetId = manifest?.entry?.asset_id || shot.reference_image_plan?.output_asset_ids?.entry;
-              const exitAssetId = manifest?.exit?.asset_id || shot.reference_image_plan?.output_asset_ids?.exit;
-              return (
-                <article className="submitVideoCard" key={shotLabel}>
-                  <header className="submitVideoCardHead">
-                    <div>
-                      <span>{shotLabel}</span>
-                      <strong>{route?.routing_decision?.selected_display_name || shot.model || route?.routing_decision?.selected_model || "未选择模型"}</strong>
-                      <small>{route?.routing_decision?.selected_preset || shot.model_params?.resolution_preset || "—"}</small>
-                    </div>
-                    <div className="submitVideoHeaderActions">
-                      <div className="submitVideoActions">
-                        <button
-                          type="button"
-                          className="quiet-button"
-                          onClick={() => setRoutingDetailShotId(shotLabel)}
-                          disabled={!route}
-                        >
-                          分析详情
-                        </button>
-                        <button
-                          type="button"
-                          className="textButton"
-                          onClick={() => void runSubmit(shot)}
-                          disabled={Boolean(busy) || !canGenerateShot}
-                          title={hasActiveShotJob ? "该分镜已有生成中的视频任务" : missingAssets.length ? `缺少必要素材：${missingAssets.join("、")}` : !hasReferencePair ? "缺少首尾参考帧" : undefined}
-                        >
-                          {isShotSubmitting ? "生成中..." : "生成"}
-                        </button>
-                      </div>
-                      <b>{shot.duration || route?.duration || 0}s</b>
-                    </div>
-                  </header>
-                  <section className="submitVideoDescription">
-                    <div>
-                      <small>描述</small>
-                      <p>{shot.prompt_zh || "暂无视频生成描述"}</p>
-                    </div>
-                  </section>
-                  <ReferenceFrameSlots
-                    shotId={shot.shot_id}
-                    manifest={manifest}
-                    plan={shot.reference_image_plan}
-                    apiBase={API_BASE}
-                    isGenerating={busy === "routing" || busy === "references"}
-                    uploadProgress={{
-                      entry: entryAssetId ? uploadProgress[entryAssetId] : undefined,
-                      exit: exitAssetId ? uploadProgress[exitAssetId] : undefined,
-                    }}
-                    uploadDisabled={Boolean(busy)}
-                    onUploadFrame={(role) => void uploadReferenceFrame(shot, role)}
-                    compact
-                  />
-                  <footer>
-                    <span>资产 {shot.references?.length || 0}</span>
-                    <span>首帧 {manifest?.entry?.asset_id || (manifest?.status === "blocked" ? "失败" : "未生成")}</span>
-                    <span>尾帧 {manifest?.exit?.asset_id || (manifest?.status === "blocked" ? "失败" : "未生成")}</span>
-                    {missingAssets.length ? <span>缺失 {missingAssets.join("、")}</span> : null}
-                  </footer>
-                </article>
-              );
-            })}
-          </div>
-          {submitResult && <div className="workflowJsonSummary autoBlockedSummary"><div><span>提交结果</span><b>{submitResult.submitted_count || 0}</b></div><pre>{JSON.stringify(submitResult, null, 2)}</pre></div>}
           </section>
+          <div className="submitShotWorkspace">
+            <section className="submitShotList submitShotMain">
+              {selectedSubmitShot ? (() => {
+                const shot = selectedSubmitShot;
+                const shotLabel = shotKey(shot);
+                const manifest = referenceMap[shotLabel];
+                const route = routingShots.find((item) => item.shot_id === shotLabel || item.source_group === shotLabel);
+                const hasActiveShotJob = activeVideoShotIds.has(shotLabel);
+                const isShotSubmitting = busy === `submit:${shotLabel}` || hasActiveShotJob;
+                const hasReferencePair = Boolean(manifest?.entry?.image_url && manifest?.exit?.image_url);
+                const missingAssets = submitMissingAssetsByShot[shotLabel] || [];
+                const canGenerateShot = Boolean(routeResult?.final_video_plan) && hasReferencePair && missingAssets.length === 0 && !hasActiveShotJob;
+                const entryAssetId = manifest?.entry?.asset_id || shot.reference_image_plan?.output_asset_ids?.entry;
+                const exitAssetId = manifest?.exit?.asset_id || shot.reference_image_plan?.output_asset_ids?.exit;
+                return (
+                  <article className="submitVideoCard" key={shotLabel}>
+                    <header className="submitVideoCardHead">
+                      <div>
+                        <span>{shotLabel}</span>
+                        <strong>{route?.routing_decision?.selected_display_name || shot.model || route?.routing_decision?.selected_model || "未选择模型"}</strong>
+                        <small>{route?.routing_decision?.selected_preset || shot.model_params?.resolution_preset || "—"}</small>
+                      </div>
+                      <div className="submitVideoHeaderActions">
+                        <div className="submitVideoActions">
+                          <button
+                            type="button"
+                            className="quiet-button"
+                            onClick={() => setRoutingDetailShotId(shotLabel)}
+                            disabled={!route}
+                          >
+                            分析详情
+                          </button>
+                          <button
+                            type="button"
+                            className="textButton"
+                            onClick={() => void runSubmit(shot)}
+                            disabled={Boolean(busy) || !canGenerateShot}
+                            title={hasActiveShotJob ? "该分镜已有生成中的视频任务" : missingAssets.length ? `缺少必要素材：${missingAssets.join("、")}` : !hasReferencePair ? "缺少首尾参考帧" : undefined}
+                          >
+                            {isShotSubmitting ? "生成中..." : "生成"}
+                          </button>
+                        </div>
+                        <b>{shot.duration || route?.duration || 0}s</b>
+                      </div>
+                    </header>
+                    <ReferenceFrameSlots
+                      shotId={shot.shot_id}
+                      manifest={manifest}
+                      plan={shot.reference_image_plan}
+                      apiBase={API_BASE}
+                      isGenerating={busy === "routing" || busy === "references"}
+                      uploadProgress={{
+                        entry: entryAssetId ? uploadProgress[entryAssetId] : undefined,
+                        exit: exitAssetId ? uploadProgress[exitAssetId] : undefined,
+                      }}
+                      uploadDisabled={Boolean(busy)}
+                      onUploadFrame={(role) => void uploadReferenceFrame(shot, role)}
+                      compact
+                    />
+                    <section className="submitVideoDescription">
+                      <label>
+                        <small>提示词</small>
+                        <textarea value={shot.prompt_zh || "暂无视频生成描述"} readOnly />
+                      </label>
+                    </section>
+                    <footer>
+                      <span>资产 {shot.references?.length || 0}</span>
+                      <span>首帧 {manifest?.entry?.asset_id || (manifest?.status === "blocked" ? "失败" : "未生成")}</span>
+                      <span>尾帧 {manifest?.exit?.asset_id || (manifest?.status === "blocked" ? "失败" : "未生成")}</span>
+                      {missingAssets.length ? <span>缺失 {missingAssets.join("、")}</span> : null}
+                    </footer>
+                  </article>
+                );
+              })() : (
+                <div className="autoEmpty">暂无可显示的分镜详情。</div>
+              )}
+            </section>
+            <aside className="submitShotRail">
+              {finalShots.map((shot) => {
+                const shotLabel = shotKey(shot);
+                const route = routingShots.find((item) => item.shot_id === shotLabel || item.source_group === shotLabel);
+                const job = submitResult?.jobs?.find((item) => item.shot_id === shotLabel);
+                const manifest = referenceMap[shotLabel];
+                const hasReferencePair = Boolean(manifest?.entry?.image_url && manifest?.exit?.image_url);
+                const hasMissingAssets = missingShotAssetIds(shot, manifest, assetUrlLookup).length > 0 || !hasReferencePair;
+                const hasVideo = Boolean(job && job.status === "succeeded" && jobHasVideoSource(job));
+                const hasFailed = ["failed", "cancelled", "blocked"].includes(String(job?.status || ""));
+                const railState = hasFailed ? "failed" : hasVideo ? "done" : hasMissingAssets ? "missing" : "pending";
+                const isSelected = selectedSubmitShot && shotLabel === shotKey(selectedSubmitShot);
+                return (
+                  <button
+                    type="button"
+                    key={shotLabel}
+                    className={[`state-${railState}`, isSelected ? "active" : ""].filter(Boolean).join(" ")}
+                    onClick={() => setSubmitDetailShotId(shotLabel)}
+                  >
+                    <span>{shotLabel}</span>
+                    <strong>{route?.routing_decision?.selected_display_name || shot.model || route?.routing_decision?.selected_model || "未选择模型"}</strong>
+                    <small>{shot.duration || route?.duration || 0}s</small>
+                  </button>
+                );
+              })}
+            </aside>
+          </div>
           {routingDetailShotId && (
             <div className="routeDetailModalBackdrop">
               <button className="routeDetailModalCloseLayer" type="button" aria-label="关闭路由分析详情" onClick={() => setRoutingDetailShotId(null)} />
@@ -2000,69 +2059,132 @@ export default function Home() {
       )}
 
       {activeStep === "compose" && (
-        <section className="card autoFullCard">
-          <div className="cardHead">
-            <div><span>07</span><div><h2>视频合成</h2><p>读取第六步 job 输出里的分镜视频路径，调用 ffmpeg 合并为完整视频。</p></div></div>
-            <button
-              type="button"
-              className="textButton"
-              onClick={() => void runCompose()}
-              disabled={Boolean(busy) || !canComposeVideos(submitResult)}
-              title={!canComposeVideos(submitResult) ? "至少需要 2 个已生成视频才能合成" : undefined}
-            >
-              {busy === "compose" ? "正在合成..." : "ffmpeg 合成视频"}
-            </button>
-          </div>
-          <div className="submitSummary">
-            <div><small>视频任务</small><strong>{submitResult?.jobs?.length || 0}</strong></div>
-            <div><small>可合成</small><strong>{composableVideoCount(submitResult)}</strong></div>
-            <div><small>合成阻塞</small><strong>{composeResult?.blocked_count || 0}</strong></div>
-            <div><small>状态</small><strong>{composeResult?.status || "待合成"}</strong></div>
-          </div>
-          <div className="submitShotList">
-            {(submitResult?.jobs || []).map((job) => {
-              const source = videoSrc(job);
-              const jobShotId = job.shot_id || "";
-              const regenerateShot = finalShots.find((shot) => shotKey(shot) === jobShotId || shot.shot_id === jobShotId || shot.group_id === jobShotId);
-              const canRegenerateJob = Boolean(regenerateShot && routeResult?.final_video_plan && !busy);
-              const statusLabel = job.status === "succeeded"
-                ? "已完成"
-                : job.status === "failed" || job.status === "cancelled" || job.status === "blocked"
-                  ? "生成失败"
-                  : "生成中";
-              return (
-                <article className={`submitVideoCard videoJob-${job.status || "queued"}`} key={job.job_id || job.shot_id}>
-                  <header className="submitVideoCardHead">
-                    <div>
+        <section className="assetCenterPage submitGenerationPage">
+          <section className="card autoFullCard submitGenerationToolbar">
+            <div className="cardHead">
+              <div><span>07</span><div><h2>视频合成</h2><p>读取第六步 job 输出里的分镜视频路径，调用 ffmpeg 合并为完整视频。</p></div></div>
+              <button
+                type="button"
+                className="generateButton autoPrimaryButton"
+                onClick={() => void runCompose()}
+                disabled={Boolean(busy) || !canComposeVideos(submitResult)}
+                title={!canComposeVideos(submitResult) ? "至少需要 2 个已生成视频才能合成" : undefined}
+              >
+                <span>{busy === "compose" ? "正在合成..." : "合成视频"}</span><b>→</b>
+              </button>
+            </div>
+          </section>
+          <div className="composeVideoWorkspace">
+            <section className="submitShotList composeMainPlayer">
+              {selectedComposeJob ? (() => {
+                const job = selectedComposeJob;
+                const source = videoSrc(job);
+                const jobShotId = job.shot_id || "";
+                const regenerateShot = finalShots.find((shot) => shotKey(shot) === jobShotId || shot.shot_id === jobShotId || shot.group_id === jobShotId);
+                const canRegenerateJob = Boolean(regenerateShot && routeResult?.final_video_plan && !busy);
+                const statusLabel = job.status === "succeeded"
+                  ? "已完成"
+                  : job.status === "failed" || job.status === "cancelled" || job.status === "blocked"
+                    ? "生成失败"
+                    : job.status === "pending"
+                      ? "已创建"
+                      : "生成中";
+                return (
+                  <article className={`submitVideoCard videoJob-${job.status || "queued"}`} key={job.job_id || job.shot_id}>
+                    <header className="submitVideoCardHead">
+                      <div>
+                        <span>{job.shot_id || "分镜"}</span>
+                        <strong>{job.model || "视频模型"}</strong>
+                        <small>{job.provider || "等待提交"}</small>
+                      </div>
+                      <b>{statusLabel}</b>
+                    </header>
+                    {job.status === "succeeded" && source ? (
+                      <video src={source} controls preload="metadata">
+                        <track kind="captions" label="暂无字幕" />
+                      </video>
+                    ) : job.status === "failed" || job.status === "cancelled" || job.status === "blocked" ? (
+                      <div className="videoJobRetryPanel">
+                        <p className="videoJobError">{job.error_message || "视频生成失败"}</p>
+                        <button
+                          type="button"
+                          className="textButton"
+                          onClick={() => regenerateShot && void runSubmit(regenerateShot)}
+                          disabled={!canRegenerateJob}
+                          title={canRegenerateJob ? undefined : "需要先加载路由与首尾帧结果后才能重新生成"}
+                        >
+                          重新生成
+                        </button>
+                      </div>
+                    ) : job.status === "pending" ? (
+                      <p className="videoJobGenerating">任务已创建，等待后台调用生成接口…</p>
+                    ) : job.status === "submitting" ? (
+                      <p className="videoJobGenerating">正在调用生成接口，提交成功后进入生成中…</p>
+                    ) : (
+                      <p className="videoJobGenerating">生成中，系统每 10 秒自动查询一次结果…</p>
+                    )}
+                  </article>
+                );
+              })() : (
+                <div className="autoEmpty">暂无视频任务。</div>
+              )}
+            </section>
+            <section className="composeVideoStrip">
+              {videoJobs.map((job) => {
+                const jobKeyValue = job.shot_id || job.job_id || "";
+                const source = videoSrc(job);
+                const jobShotId = job.shot_id || "";
+                const regenerateShot = finalShots.find((shot) => shotKey(shot) === jobShotId || shot.shot_id === jobShotId || shot.group_id === jobShotId);
+                const canRegenerateJob = Boolean(regenerateShot && routeResult?.final_video_plan && !busy);
+                const hasVideo = job.status === "succeeded" && jobHasVideoSource(job);
+                const hasFailed = ["failed", "cancelled", "blocked"].includes(String(job.status || ""));
+                const railState = hasFailed ? "failed" : hasVideo ? "done" : "pending";
+                const isSelected = selectedComposeJob && jobKeyValue === (selectedComposeJob.shot_id || selectedComposeJob.job_id || "");
+                const statusLabel = hasVideo ? "已完成" : hasFailed ? "生成失败" : job.status === "pending" ? "已创建" : "生成中";
+                return (
+                  <div
+                    key={job.job_id || job.shot_id}
+                    className={["composeVideoThumb", `state-${railState}`, isSelected ? "active" : ""].filter(Boolean).join(" ")}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setSubmitDetailShotId(jobKeyValue)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        setSubmitDetailShotId(jobKeyValue);
+                      }
+                    }}
+                  >
+                    <div className="composeThumbPick">
+                      {source ? (
+                        <video src={source} controls muted preload="metadata">
+                          <track kind="captions" label="暂无字幕" />
+                        </video>
+                      ) : (
+                        <i>{statusLabel}</i>
+                      )}
+                    </div>
+                    <div className="composeThumbMeta">
                       <span>{job.shot_id || "分镜"}</span>
-                      <strong>{job.model || "视频模型"}</strong>
-                      <small>{job.provider || "等待提交"}</small>
+                      <small>{statusLabel} · {job.duration || 0}s</small>
+                      {hasFailed ? (
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            if (regenerateShot) void runSubmit(regenerateShot);
+                          }}
+                          disabled={!canRegenerateJob}
+                          title={canRegenerateJob ? undefined : "需要先加载路由与首尾帧结果后才能重新生成"}
+                        >
+                          重新生成
+                        </button>
+                      ) : null}
                     </div>
-                    <b>{statusLabel}</b>
-                  </header>
-                  {job.status === "succeeded" && source ? (
-                    <video src={source} controls preload="metadata">
-                      <track kind="captions" label="暂无字幕" />
-                    </video>
-                  ) : job.status === "failed" || job.status === "cancelled" || job.status === "blocked" ? (
-                    <div className="videoJobRetryPanel">
-                      <p className="videoJobError">{job.error_message || "视频生成失败"}</p>
-                      <button
-                        type="button"
-                        className="textButton"
-                        onClick={() => regenerateShot && void runSubmit(regenerateShot)}
-                        disabled={!canRegenerateJob}
-                        title={canRegenerateJob ? undefined : "需要先加载路由与首尾帧结果后才能重新生成"}
-                      >
-                        重新生成
-                      </button>
-                    </div>
-                  ) : (
-                    <p className="videoJobGenerating">生成中，系统每 10 秒自动查询一次结果…</p>
-                  )}
-                </article>
-              );
-            })}
+                  </div>
+                );
+              })}
+            </section>
           </div>
           {composeResult?.output_url ? (
             <div className="workflowJsonSummary autoBlockedSummary">

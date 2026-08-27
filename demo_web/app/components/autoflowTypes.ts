@@ -323,6 +323,7 @@ export type SubmitResponse = {
     provider?: string;
     provider_task_id?: string;
     status?: string;
+    duration?: number | string;
     bound_asset_ids?: string[];
     derived_reference_ids?: string[];
     output_video_path?: string;

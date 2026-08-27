@@ -1443,6 +1443,21 @@ textarea:focus {
   gap:8px;
 }
 
+.videoHeroStats {
+  min-width:520px;
+  grid-template-columns:repeat(4,1fr);
+}
+
+.cardHead .autoPrimaryButton {
+  flex:0 0 auto;
+  width:auto;
+  min-width:140px;
+  min-height:32px;
+  margin:0;
+  padding:0 13px;
+  gap:8px;
+}
+
 .analysisTemplateShell .textButton {
   width:auto;
   min-height:32px;
@@ -3154,6 +3169,107 @@ button.frameSlotStatus:disabled {
   gap:10px;
 }
 
+.submitGenerationPage {
+  display:grid;
+  gap:10px;
+}
+
+.submitGenerationToolbar {
+  margin:0;
+}
+
+.submitGenerationToolbar .cardHead {
+  border-bottom:0;
+}
+
+.submitShotWorkspace {
+  height:calc(100vh - 480px);
+  min-height:360px;
+  margin:0;
+  overflow:hidden;
+  display:grid;
+  grid-template-columns:minmax(0,1fr) 180px;
+  gap:12px;
+  align-items:start;
+}
+
+.submitShotWorkspace .submitShotList {
+  height:100%;
+  margin:0;
+  min-width:0;
+  overflow:auto;
+}
+
+.submitShotRail {
+  height:100%;
+  max-height:none;
+  overflow:auto;
+  display:grid;
+  gap:8px;
+  align-content:start;
+  position:static;
+}
+
+.submitShotRail button {
+  width:100%;
+  padding:10px 11px;
+  display:grid;
+  gap:5px;
+  text-align:left;
+  border:1px solid var(--line);
+  border-radius:11px;
+  color:#5f596a;
+  background:#fff;
+  cursor:pointer;
+}
+
+.submitShotRail button.state-missing {
+  border-color:#f2b86d;
+}
+
+.submitShotRail button.state-done {
+  border-color:#67c68f;
+}
+
+.submitShotRail button.state-failed {
+  border-color:#e26d68;
+}
+
+.submitShotRail button.state-pending {
+  border-color:#d8d5df;
+}
+
+.submitShotRail button:hover,
+.submitShotRail button.active {
+  border-color:#a996f3;
+  background:#f5f1ff;
+  box-shadow:0 8px 20px rgba(92,70,170,.1);
+}
+
+.submitShotRail span,
+.submitShotRail strong,
+.submitShotRail small {
+  display:block;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+.submitShotRail span {
+  color:#7457dc;
+  font:10px var(--font-geist-mono),monospace;
+}
+
+.submitShotRail strong {
+  color:#25222d;
+  font:700 11px var(--font-geist-mono),monospace;
+}
+
+.submitShotRail small {
+  color:#8b8495;
+  font-size:9px;
+}
+
 .submitShotList header,
 .submitShotList footer {
   padding:10px 12px;
@@ -3188,17 +3304,23 @@ button.frameSlotStatus:disabled {
 }
 
 .submitShotList footer {
+  flex:0 0 auto;
   border-top:1px solid var(--line);
   color:var(--muted);
   font-size:9px;
 }
 
 .submitShotList .submitVideoCard {
+  height:100%;
+  overflow:hidden;
+  display:flex;
+  flex-direction:column;
   border-color:#ded9ea;
   box-shadow:0 10px 30px rgba(35,29,55,.05);
 }
 
 .submitVideoCardHead {
+  flex:0 0 auto;
   min-height:76px;
   padding:12px 14px;
   display:flex;
@@ -3263,27 +3385,37 @@ button.frameSlotStatus:disabled {
 
 .submitVideoDescription {
   position:relative;
-  min-height:92px;
+  flex:1 1 auto;
+  min-height:0;
   padding:12px 14px;
-  color:#efeef6;
-  background:#25222d;
+  color:#403a4c;
+  background:#fff;
   border-top:0;
+}
+
+.submitVideoDescription label {
+  height:100%;
+  display:flex;
+  flex-direction:column;
 }
 
 .submitVideoDescription small {
   display:block;
   margin-bottom:7px;
-  color:#aaa6b2;
+  color:#8d849a;
   font-size:9px;
 }
 
-.submitVideoDescription p {
-  max-height:132px;
-  margin:0;
-  overflow:auto;
-  padding:0;
-  color:#f3f1f8;
-  background:transparent;
+.submitVideoDescription textarea {
+  flex:1 1 auto;
+  min-height:0;
+  width:100%;
+  resize:none;
+  padding:10px 11px;
+  color:#403a4c;
+  background:#fbfaff;
+  border:1px solid #ded8f0;
+  border-radius:9px;
   font:9px/1.65 var(--font-geist-mono),Consolas,monospace;
   white-space:pre-wrap;
 }
@@ -3323,13 +3455,187 @@ button.frameSlotStatus:disabled {
   cursor:not-allowed;
 }
 
+.composeShotWorkspace .submitVideoCard > video {
+  flex:1 1 auto;
+  min-height:0;
+  width:100%;
+  height:100%;
+  object-fit:contain;
+  background:#0d0b14;
+}
+
+.composeShotWorkspace .videoJobGenerating,
+.composeShotWorkspace .videoJobRetryPanel {
+  flex:1 1 auto;
+}
+
+.composeVideoWorkspace {
+  height:calc(100vh - 480px);
+  min-height:0;
+  margin:0;
+  overflow:hidden;
+  display:grid;
+  grid-template-rows:minmax(0,1fr) 320px;
+  gap:12px;
+}
+
+.composeMainPlayer {
+  height:100%;
+  margin:0;
+  min-height:0;
+  overflow:hidden;
+}
+
+.composeMainPlayer .submitVideoCard {
+  height:100%;
+  overflow:hidden;
+  display:flex;
+  flex-direction:column;
+}
+
+.composeMainPlayer .submitVideoCard > video {
+  flex:1 1 auto;
+  min-height:0;
+  max-height:none;
+  width:100%;
+  height:100%;
+  object-fit:contain;
+  background:#0d0b14;
+}
+
+.composeMainPlayer .videoJobGenerating,
+.composeMainPlayer .videoJobRetryPanel {
+  flex:1 1 auto;
+}
+
+.composeVideoStrip {
+  min-width:0;
+  overflow-x:auto;
+  overflow-y:hidden;
+  display:flex;
+  gap:10px;
+  padding-bottom:4px;
+}
+
+.composeVideoThumb {
+  flex:0 0 150px;
+  width:150px;
+  height:100%;
+  overflow:hidden;
+  display:grid;
+  grid-template-rows:minmax(0,1fr) auto;
+  text-align:left;
+  border:1px solid #d8d5df;
+  border-radius:12px;
+  color:#5f596a;
+  background:#fff;
+}
+
+.composeVideoThumb.state-done { border-color:#67c68f; }
+.composeVideoThumb.state-failed { border-color:#e26d68; }
+.composeVideoThumb.state-pending { border-color:#d8d5df; }
+
+.composeVideoThumb:hover,
+.composeVideoThumb.active {
+  border-color:#a996f3;
+  background:#f5f1ff;
+  box-shadow:0 8px 20px rgba(92,70,170,.1);
+}
+
+.composeVideoThumb:focus-visible {
+  outline:2px solid #a996f3;
+  outline-offset:2px;
+}
+
+.composeThumbPick {
+  min-height:0;
+  width:100%;
+  padding:0;
+  overflow:hidden;
+  border:0;
+  background:#0d0b14;
+  cursor:pointer;
+}
+
+.composeVideoStrip video,
+.composeVideoStrip i {
+  width:100%;
+  height:100%;
+  background:#0d0b14;
+}
+
+.composeVideoStrip video {
+  object-fit:cover;
+}
+
+.composeVideoStrip i {
+  display:grid;
+  place-items:center;
+  color:#b8afd4;
+  font:10px var(--font-geist-mono),monospace;
+  font-style:normal;
+}
+
+.composeThumbMeta {
+  padding:7px 9px 8px;
+  display:grid;
+  gap:3px;
+  background:#fff;
+}
+
+.composeVideoStrip span,
+.composeVideoStrip strong,
+.composeVideoStrip small {
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  padding:0;
+}
+
+.composeVideoStrip span {
+  color:#7457dc;
+  font:10px var(--font-geist-mono),monospace;
+}
+
+.composeVideoStrip strong {
+  color:#25222d;
+  font:700 11px var(--font-geist-mono),monospace;
+}
+
+.composeVideoStrip small {
+  color:#8b8495;
+  font-size:9px;
+}
+
+.composeThumbMeta button {
+  width:100%;
+  min-height:24px;
+  margin-top:4px;
+  border:0;
+  border-radius:7px;
+  color:#fff;
+  background:#e26d68;
+  font-size:9px;
+  cursor:pointer;
+}
+
+.composeThumbMeta button:disabled {
+  opacity:.55;
+  cursor:not-allowed;
+}
+
 .submitShotList .frameSlots.compact {
+  flex:0 0 auto;
   border-top:1px solid var(--line);
   background:#fbfaff;
 }
 
+.submitShotList .frameSlots.compact figcaption {
+  display:none;
+}
+
 .submitShotList .frameSlots.compact .frameSlotCanvas {
-  height:300px;
+  height:220px;
   background:#fff;
 }
 
@@ -3342,7 +3648,7 @@ button.frameSlotStatus:disabled {
 .submitShotList .frameSlots.compact .frameSlot.state-completed,
 .submitShotList .frameSlots.compact .frameSlot.state-uploaded,
 .submitShotList .frameSlots.compact .frameSlot.state-uploading {
-  height:300px;
+  height:220px;
   display:flex;
   flex-direction:column;
 }
@@ -3471,6 +3777,35 @@ button.frameSlotStatus:disabled {
   .routeRefs,
   .submitSummary {
     grid-template-columns:1fr;
+  }
+
+  .submitShotWorkspace {
+    height:auto;
+    min-height:0;
+    overflow:visible;
+    grid-template-columns:1fr;
+  }
+
+  .submitShotWorkspace .submitShotList {
+    height:auto;
+    overflow:visible;
+  }
+
+  .submitShotRail {
+    height:auto;
+    max-height:none;
+    position:static;
+    grid-template-columns:repeat(2,minmax(0,1fr));
+  }
+
+  .composeVideoWorkspace {
+    height:auto;
+    min-height:0;
+    overflow:visible;
+  }
+
+  .composeMainPlayer {
+    min-height:360px;
   }
 }
 
